@@ -28,6 +28,8 @@ function getNsRoute(origin, destination, targetTime, isDepartureTime) {
     destinationName: destination,
     dateTime: formatNsDateTime(targetTime),
     searchForArrival: !isDepartureTime,
+    previousAdvices: 3,   // Extra trips before/after, for the earlier/later options
+    nextAdvices: 3,
     lang: CONFIG.NS.language || 'en'
   };
   const query = Object.keys(params)
@@ -50,13 +52,19 @@ function getNsRoute(origin, destination, targetTime, isDepartureTime) {
   }
 
   const data = JSON.parse(response.getContentText());
-  const trip = pickNsTrip(data.trips || [], targetTime, isDepartureTime);
-  if (!trip) return null;
+  const candidates = (data.trips || [])
+    .filter(t => t.legs && t.legs.length > 0 && t.status !== 'CANCELLED')
+    .map(t => ({
+      trip: t,
+      departureTime: parseNsDate(nsTime(t.legs[0].origin)),
+      arrivalTime: parseNsDate(nsTime(t.legs[t.legs.length - 1].destination))
+    }));
 
-  const legs = trip.legs;
-  const departureTime = parseNsDate(nsTime(legs[0].origin));
-  const arrivalTime = parseNsDate(nsTime(legs[legs.length - 1].destination));
-  const durationMins = Math.round((arrivalTime - departureTime) / 60000)
+  const best = pickFastestConnection(candidates, targetTime, isDepartureTime);
+  if (!best) return null;
+
+  const trip = best.trip;
+  const durationMins = Math.round((best.arrivalTime - best.departureTime) / 60000)
     || trip.actualDurationInMinutes || trip.plannedDurationInMinutes;
 
   return {
@@ -66,36 +74,17 @@ function getNsRoute(origin, destination, targetTime, isDepartureTime) {
     fareText: trip.productFare && trip.productFare.priceInCents
       ? `€${(trip.productFare.priceInCents / 100).toFixed(2)}`
       : null,
-    departureTime,
-    arrivalTime,
-    url: trip.shareUrl && trip.shareUrl.uri ? trip.shareUrl.uri : 'https://www.ns.nl/en/journeyplanner/',
-    stepsHtml: formatNsStepsHtml(trip)
+    departureTime: best.departureTime,
+    arrivalTime: best.arrivalTime,
+    transfers: trip.transfers || 0,
+    url: nsTripUrl(trip),
+    stepsHtml: formatNsStepsHtml(trip),
+    alternatives: pickAlternatives(candidates, best, c => nsTripUrl(c.trip))
   };
 }
 
-/**
- * Arriving: the latest departure that still arrives on time.
- * Departing: the earliest arrival that leaves after the given time.
- */
-function pickNsTrip(trips, targetTime, isDepartureTime) {
-  const candidates = trips
-    .filter(t => t.legs && t.legs.length > 0 && t.status !== 'CANCELLED')
-    .map(t => ({
-      trip: t,
-      dep: parseNsDate(nsTime(t.legs[0].origin)),
-      arr: parseNsDate(nsTime(t.legs[t.legs.length - 1].destination))
-    }));
-
-  let best = null;
-  candidates.forEach(c => {
-    if (isDepartureTime) {
-      if (c.dep >= targetTime && (!best || c.arr < best.arr)) best = c;
-    } else if (c.arr <= targetTime && (!best || c.dep > best.dep)) {
-      best = c;
-    }
-  });
-
-  return best ? best.trip : null;
+function nsTripUrl(trip) {
+  return trip.shareUrl && trip.shareUrl.uri ? trip.shareUrl.uri : 'https://www.ns.nl/en/journeyplanner/';
 }
 
 function formatNsStepsHtml(trip) {

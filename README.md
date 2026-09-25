@@ -42,6 +42,16 @@ All options live in [`src/Config.gs`](src/Config.gs) and are documented inline: 
 
 Copy [`Config.local.example.gs`](Config.local.example.gs) to `src/Config.local.gs` and fill in your details. That file is git-ignored, so it never ends up on GitHub. Add it to your Apps Script project as an extra file named `Config.local`; its values override `Config.gs`.
 
+## Testing
+
+The tests run the real `src/*.gs` files in Node.js against fake Google services (Calendar, Maps, NS API, Script Properties), in a shared global scope just like Apps Script. They cover change detection, which events get blocks, the event title/description and how public transport connections are picked.
+
+```sh
+npm test        # or: pnpm test  (Node.js 22+, no dependencies)
+```
+
+The tests run on every push via GitHub Actions. They prove the script's logic, not the behaviour of the real Google and NS services, so do a real run in Apps Script after bigger changes.
+
 ## Notes
 
 - Google Apps Script has daily quotas for Maps requests. Only new or changed events are recalculated (about 5–6 requests each), so after the first run usage stays low. Run `forceRefreshAll` to recalculate everything, e.g. for fresh traffic or timetable data.

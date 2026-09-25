@@ -14,8 +14,7 @@
 const SOURCE_TAG = 'SOURCE_EVENT_ID';
 const STATE_PREFIX = 'TRAVEL_STATE_';
 const MAX_RUNTIME_MS = 5 * 60 * 1000; // Apps Script stops a run after 6 minutes
-// Bump when the travel block output changes, so every block gets recreated once.
-const SCRIPT_VERSION = 2;
+const CODE_FINGERPRINT_KEY = 'CODE_FINGERPRINT';
 
 // Route requests / block creations that failed during this run.
 let failedRequests = 0;
@@ -105,6 +104,7 @@ function runScan(deadline) {
   cleanupOrphanedTravelBlocks(existingBlocks, sourceEvents, now, future);
 
   const props = PropertiesService.getScriptProperties();
+  logCodeUpdate(props);
   const configFingerprint = getConfigFingerprint();
   let unchanged = 0;
 
@@ -207,8 +207,6 @@ function createBlocksForPlan(targetCalendar, eventKey, plan) {
       origin: plan.origin,
       destination: plan.destination,
       originSource: plan.originSource,
-      start: selectedRoute.departureTime || new Date(arrivalTime.getTime() - (selectedRoute.durationSec * 1000)),
-      end: arrivalTime,
       selectedRoute,
       routes,
       bufferMins: plan.bufferMins
@@ -245,8 +243,6 @@ function handleReturnTravel(targetCalendar, eventKey, plan) {
     origin: plan.destination,
     destination: plan.home,
     originSource: 'Last Event Location',
-    start: endTime,
-    end: selectedRoute.arrivalTime || new Date(endTime.getTime() + (selectedRoute.durationSec * 1000)),
     selectedRoute,
     routes: returnRoutes,
     bufferMins: 0
@@ -349,10 +345,52 @@ function pruneState(props, sourceEvents) {
 }
 
 /**
- * Settings that affect every travel block; changing any of them refreshes all blocks.
+ * Code and settings that affect every travel block; changing any of them refreshes
+ * all upcoming blocks.
  */
 function getConfigFingerprint() {
-  return JSON.stringify([SCRIPT_VERSION, CONFIG, getSetting('HOME_LOCATION'), Boolean(getSetting('NS_API_KEY'))]);
+  return JSON.stringify([getCodeFingerprint(), CONFIG, getSetting('HOME_LOCATION'), Boolean(getSetting('NS_API_KEY'))]);
+}
+
+/**
+ * Fingerprint of the script's own code: the source of every function in the project
+ * plus the lookup tables. Updating the script changes it, so all upcoming travel
+ * blocks are recreated once. No version number to remember to bump.
+ */
+function getCodeFingerprint() {
+  const scope = globalThis;
+  const sources = Object.getOwnPropertyNames(scope)
+    .map(name => {
+      try {
+        return typeof scope[name] === 'function' ? scope[name].toString() : null;
+      } catch (e) {
+        return null;
+      }
+    })
+    .filter(source => source && !source.includes('[native code]'))
+    .sort();
+
+  if (!sources.some(source => source.startsWith('function processTravelBlocks('))) {
+    console.warn('Could not read the script source; code updates will not refresh travel blocks automatically.');
+  }
+
+  const tables = [TRAVEL_MODES, ROUTE_DISPLAY_ORDER, GOOGLE_MODE_KEYS, TRANSIT_SEARCH_SHIFT_MIN,
+    ALTERNATIVE_WINDOW_MIN, NS_TRIPS_URL, NS_TIME_ZONE, SOURCE_TAG];
+  return shortHash(JSON.stringify([sources, tables]), 16);
+}
+
+/**
+ * Logs when the script code changed since the last run.
+ */
+function logCodeUpdate(props) {
+  const fingerprint = getCodeFingerprint();
+  const previous = props.getProperty(CODE_FINGERPRINT_KEY);
+  if (previous !== fingerprint) {
+    console.log(`Script code ${previous ? 'updated' : 'first run'} (version ${fingerprint}): recalculating all upcoming travel blocks.`);
+    props.setProperty(CODE_FINGERPRINT_KEY, fingerprint);
+  } else {
+    console.log(`Script version ${fingerprint}`);
+  }
 }
 
 function scheduleContinuation() {
@@ -472,27 +510,30 @@ function isLastEventOfDay(events, currentIndex) {
 
 // --- CALENDAR EVENT OUTPUT ---
 
-function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destination, originSource, start, end, selectedRoute, routes, bufferMins }) {
-  const leaveAt = formatTime(selectedRoute.departureTime || start);
+function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destination, originSource, selectedRoute, routes, bufferMins }) {
+  // The block covers the actual travel: for public transport that's from leaving
+  // until arriving, which can be earlier than the arrival buffer.
+  const start = selectedRoute.departureTime;
+  const end = selectedRoute.arrivalTime;
+  const leaveAt = formatTime(start);
   const mode = TRAVEL_MODES[selectedRoute.key];
   const eventTitle = `${mode.emoji} Leave ${leaveAt} · ${mode.label}${isReturn ? ' home' : ''}`;
 
   const htmlDescription = [
     `📍 <a href="${selectedRoute.url}"><b>Open ${selectedRoute.key === 'NS' ? 'NS Journey Planner' : 'Google Maps Directions'}</b></a>`,
-    `<br><b>Leave at:</b> ${leaveAt}`,
-    `<b>Mode:</b> ${mode.label}${isReturn ? ' (Return)' : ''}`,
-    `<b>Route:</b> ${escapeHtml(origin)} ➔ ${escapeHtml(destination)}`,
+    `<br><b>Mode:</b> ${mode.label}${isReturn ? ' (Return)' : ''}`,
+    `<b>Route:</b> ${escapeHtml(singleLine(origin))} ➔ ${escapeHtml(singleLine(destination))}`,
     `<b>Origin Source:</b> ${escapeHtml(originSource)}`,
     `<b>Duration:</b> ${selectedRoute.durationText}`,
-    `<b>Buffer:</b> ${bufferMins} mins before event`,
+    isReturn ? null : `<b>Buffer:</b> ${bufferMins} mins before event`,
     `<br>${formatAllRouteSummaryHtml(routes, selectedRoute.key)}`,
     `<br>${selectedRoute.stepsHtml}`
-  ].join('<br>');
+  ].filter(line => line !== null).join('<br>');
 
   try {
     const newEvent = targetCalendar.createEvent(eventTitle, start, end, {
       description: htmlDescription,
-      location: `From: ${origin}`
+      location: singleLine(origin)
     });
 
     newEvent.setTag(SOURCE_TAG, eventKey);
@@ -507,10 +548,11 @@ function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destina
 }
 
 /**
- * Lists every travel mode as a clickable link that opens that specific mode.
+ * Lists every travel mode with its leave time, each linking to that specific mode.
+ * Public transport also lists the connection before and after.
  */
 function formatAllRouteSummaryHtml(routes, selectedKey) {
-  const lines = ['<b>📊 Travel Options Comparison:</b>'];
+  const lines = ['<b>📊 Travel Options:</b>'];
 
   ROUTE_DISPLAY_ORDER.forEach(key => {
     const mode = TRAVEL_MODES[key];
@@ -522,13 +564,33 @@ function formatAllRouteSummaryHtml(routes, selectedKey) {
       }
       return;
     }
-    const fare = r.fareText ? ` (${escapeHtml(r.fareText)})` : '';
-    const leave = r.departureTime ? `, leave ${formatTime(r.departureTime)}` : '';
+    const transfers = r.transfers !== undefined ? ` · ${r.transfers} transfer(s)` : '';
+    const fare = r.fareText ? ` · ${escapeHtml(r.fareText)}` : '';
     const marker = key === selectedKey ? ' ✅' : '';
-    lines.push(`• <a href="${r.url}">${mode.emoji} ${mode.label}</a>: <b>${r.durationText}</b>${leave}${fare}${marker}`);
+    lines.push(`• <a href="${r.url}">${mode.emoji} ${mode.label}</a>: <b>${formatTimeSpan(r)}</b>${transfers}${fare}${marker}`);
+
+    const alternatives = r.alternatives || {};
+    [['earlier', 'Arrive earlier'], ['later', 'Arrive later']].forEach(([which, label]) => {
+      const alt = alternatives[which];
+      if (alt) {
+        lines.push(`&nbsp;&nbsp;&nbsp;&nbsp;↳ <a href="${alt.url}">${label}</a>: ${formatTimeSpan(alt)}`);
+      }
+    });
   });
 
   return lines.join('<br>');
+}
+
+/** "14:17 - 14:25 (0:08)": leave time, arrival time and travel time (H:MM). */
+function formatTimeSpan(connection) {
+  const totalMinutes = Math.round((connection.arrivalTime - connection.departureTime) / 60000);
+  const duration = `${Math.floor(totalMinutes / 60)}:${String(totalMinutes % 60).padStart(2, '0')}`;
+  return `${formatTime(connection.departureTime)} - ${formatTime(connection.arrivalTime)} (${duration})`;
+}
+
+/** Multi-line addresses (common in calendar invites) on one line. */
+function singleLine(text) {
+  return String(text || '').replace(/\s*[\r\n]+\s*/g, ', ').trim();
 }
 
 function escapeHtml(str) {

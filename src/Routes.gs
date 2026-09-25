@@ -14,6 +14,9 @@ const TRAVEL_MODES = {
 const GOOGLE_MODE_KEYS = ['WALKING', 'BICYCLING', 'TRANSIT', 'DRIVING'];
 const ROUTE_DISPLAY_ORDER = ['WALKING', 'BICYCLING', 'TRANSIT', 'NS', 'DRIVING'];
 
+const TRANSIT_SEARCH_SHIFT_MIN = 30;  // Search for later transit connections up to this much later
+const ALTERNATIVE_WINDOW_MIN = 60;    // Earlier/later connections must arrive within this of the chosen one
+
 /**
  * Calculates a route for every travel mode.
  * @param {Date} targetTime Arrival time, or departure time when isDepartureTime is true.
@@ -43,7 +46,7 @@ function calculateAllRoutes(origin, destination, targetTime, isDepartureTime) {
   return results;
 }
 
-function requestDirections(key, origin, destination, time, isDepartureTime) {
+function requestRoutes(key, origin, destination, time, isDepartureTime, alternatives) {
   if (CONFIG.API_DELAY_MS > 0) {
     Utilities.sleep(CONFIG.API_DELAY_MS);
   }
@@ -51,7 +54,8 @@ function requestDirections(key, origin, destination, time, isDepartureTime) {
   const finder = Maps.newDirectionFinder()
     .setOrigin(origin)
     .setDestination(destination)
-    .setMode(Maps.DirectionFinder.Mode[key]);
+    .setMode(Maps.DirectionFinder.Mode[key])
+    .setAlternatives(Boolean(alternatives));
 
   if (isDepartureTime) {
     finder.setDepart(time);
@@ -60,10 +64,18 @@ function requestDirections(key, origin, destination, time, isDepartureTime) {
   }
 
   const response = finder.getDirections();
-  return response.routes && response.routes.length > 0 ? response.routes[0] : null;
+  return response.routes || [];
+}
+
+function requestDirections(key, origin, destination, time, isDepartureTime) {
+  return requestRoutes(key, origin, destination, time, isDepartureTime, false)[0] || null;
 }
 
 function getGoogleRoute(key, origin, destination, targetTime, isDepartureTime) {
+  if (key === 'TRANSIT') {
+    return getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime);
+  }
+
   const route = requestDirections(key, origin, destination, targetTime, isDepartureTime);
   if (!route) return null;
 
@@ -85,16 +97,125 @@ function getGoogleRoute(key, origin, destination, targetTime, isDepartureTime) {
     duration = leg.duration_in_traffic;
   }
 
-  return {
+  return withTravelTimes({
     key,
     durationSec: duration.value,
     durationText: duration.text,
     fareText: route.fare ? route.fare.text : null,
-    departureTime: leg.departure_time ? new Date(leg.departure_time.value * 1000) : null,
-    arrivalTime: leg.arrival_time ? new Date(leg.arrival_time.value * 1000) : null,
+    departureTime: null,
+    arrivalTime: null,
     url: buildGoogleMapsUrl(origin, destination, TRAVEL_MODES[key].urlCode, targetTime, isDepartureTime),
     stepsHtml: formatGoogleStepsHtml(route)
+  }, targetTime, isDepartureTime);
+}
+
+/**
+ * Google transit: collects connections around the target time and picks the fastest,
+ * plus the fastest connection arriving earlier and later.
+ */
+function getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime) {
+  const connections = [];
+  const search = (time, departAt) => {
+    requestRoutes('TRANSIT', origin, destination, time, departAt, true).forEach(route => {
+      const leg = route.legs[0];
+      if (!leg.departure_time || !leg.arrival_time) return;
+      const connection = {
+        route,
+        departureTime: new Date(leg.departure_time.value * 1000),
+        arrivalTime: new Date(leg.arrival_time.value * 1000)
+      };
+      const duplicate = connections.some(c => c.departureTime.getTime() === connection.departureTime.getTime()
+        && c.arrivalTime.getTime() === connection.arrivalTime.getTime());
+      if (!duplicate) connections.push(connection);
+    });
   };
+
+  search(targetTime, isDepartureTime);
+  const first = pickFastestConnection(connections, targetTime, isDepartureTime);
+  if (!first) return null;
+
+  // Look for connections arriving just before and up to TRANSIT_SEARCH_SHIFT_MIN after it.
+  try {
+    if (!isDepartureTime) search(new Date(first.arrivalTime.getTime() - 60 * 1000), false);
+    search(new Date(first.arrivalTime.getTime() + TRANSIT_SEARCH_SHIFT_MIN * 60 * 1000), false);
+  } catch (e) {
+    console.warn(`  -> Extra transit search failed: ${e}`);
+  }
+
+  // The extra searches may have found an even faster connection that is still on time.
+  const chosen = pickFastestConnection(connections, targetTime, isDepartureTime);
+
+  const leg = chosen.route.legs[0];
+  const transitUrl = c => buildGoogleMapsUrl(origin, destination, TRAVEL_MODES.TRANSIT.urlCode, c.arrivalTime, false);
+  return {
+    key: 'TRANSIT',
+    durationSec: (chosen.arrivalTime - chosen.departureTime) / 1000,
+    durationText: leg.duration.text,
+    fareText: chosen.route.fare ? chosen.route.fare.text : null,
+    departureTime: chosen.departureTime,
+    arrivalTime: chosen.arrivalTime,
+    url: transitUrl(chosen),
+    stepsHtml: formatGoogleStepsHtml(chosen.route),
+    alternatives: pickAlternatives(connections, chosen, transitUrl)
+  };
+}
+
+/**
+ * Fills in departure/arrival times for modes without a timetable (walking, biking,
+ * driving): you leave just in time to arrive at targetTime, or leave at targetTime.
+ */
+function withTravelTimes(route, targetTime, isDepartureTime) {
+  const durationMs = route.durationSec * 1000;
+  if (!route.departureTime && !route.arrivalTime) {
+    route.departureTime = isDepartureTime ? targetTime : new Date(targetTime.getTime() - durationMs);
+  }
+  if (!route.departureTime) route.departureTime = new Date(route.arrivalTime.getTime() - durationMs);
+  if (!route.arrivalTime) route.arrivalTime = new Date(route.departureTime.getTime() + durationMs);
+  return route;
+}
+
+// --- PUBLIC TRANSPORT CONNECTIONS (Google transit and NS) ---
+// A connection is { departureTime, arrivalTime, ... }.
+
+/**
+ * The connection with the shortest total travel time.
+ * Arriving: among connections that arrive on time, the shortest trip.
+ * Departing (trip home): time counts from targetTime, so the earliest arrival wins.
+ */
+function pickFastestConnection(connections, targetTime, isDepartureTime) {
+  const onTime = connections.filter(c => (isDepartureTime ? c.departureTime >= targetTime : c.arrivalTime <= targetTime));
+  return pickShortest(onTime, isDepartureTime ? targetTime : null);
+}
+
+/**
+ * Shortest trip; on a tie the one leaving last. countFrom overrides the departure
+ * time as the start of the trip (used when waiting counts as travel time).
+ */
+function pickShortest(connections, countFrom) {
+  const total = c => c.arrivalTime - (countFrom || c.departureTime);
+  return connections.reduce((best, c) => {
+    if (!best || total(c) < total(best) || (total(c) === total(best) && c.departureTime > best.departureTime)) return c;
+    return best;
+  }, null);
+}
+
+/**
+ * The fastest connection that really arrives earlier, and later, than the chosen one
+ * (within ALTERNATIVE_WINDOW_MIN of it).
+ */
+function pickAlternatives(connections, chosen, urlFor) {
+  const windowMs = ALTERNATIVE_WINDOW_MIN * 60 * 1000;
+  const chosenArrival = chosen.arrivalTime.getTime();
+  const earlier = pickShortest(connections.filter(c =>
+    c.arrivalTime.getTime() < chosenArrival && c.arrivalTime.getTime() >= chosenArrival - windowMs), null);
+  const later = pickShortest(connections.filter(c =>
+    c.arrivalTime.getTime() > chosenArrival && c.arrivalTime.getTime() <= chosenArrival + windowMs), null);
+
+  const toAlternative = c => ({ departureTime: c.departureTime, arrivalTime: c.arrivalTime, url: urlFor(c) });
+  const alternatives = {};
+  if (earlier) alternatives.earlier = toAlternative(earlier);
+  if (later) alternatives.later = toAlternative(later);
+  return alternatives;
 }
 
 /**
@@ -130,7 +251,7 @@ function pickPublicTransport(routes) {
  * (or "Depart at") preset to the given time, so traffic and timetables match.
  */
 function buildGoogleMapsUrl(origin, destination, modeCode, time, isDepartureTime) {
-  const base = `https://www.google.com/maps/dir/${encodeURIComponent(origin)}/${encodeURIComponent(destination)}/`;
+  const base = `https://www.google.com/maps/dir/${encodeURIComponent(singleLine(origin))}/${encodeURIComponent(singleLine(destination))}/`;
   // !6e0 = depart at, !6e1 = arrive by; !8j = local wall-clock time as Unix seconds.
   const timeType = isDepartureTime ? 0 : 1;
   return `${base}data=!4m6!4m5!2m3!6e${timeType}!7e2!8j${toWallClockSeconds(time)}!3e${modeCode}`;
