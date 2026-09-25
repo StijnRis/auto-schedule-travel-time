@@ -12,7 +12,7 @@ A Google Apps Script that reads your Google Calendar and automatically adds **tr
 - Plans from your previous event's location when events are close together, otherwise from home.
 - Adds a return trip home after the last event of the day.
 - Keyword rules, e.g. arrive 2 hours early for anything titled "flight".
-- Keeps itself up to date: moved, renamed or deleted events get their travel blocks recalculated or removed.
+- Keeps itself up to date: when an event's trip changes (time, location, where you come from, or your settings), its travel blocks are recalculated; deleted events get theirs removed. Unchanged events are left alone.
 
 ## Setup
 
@@ -44,7 +44,7 @@ Copy [`Config.local.example.gs`](Config.local.example.gs) to `src/Config.local.g
 
 ## Notes
 
-- Google Apps Script has daily quotas for Maps requests. Every run requests 4–5 routes per event in the lookahead window, so keep `SEARCH_RANGE_DAYS` modest if you have many events.
+- Google Apps Script has daily quotas for Maps requests. Only new or changed events are recalculated (about 5–6 requests each), so after the first run usage stays low. Run `forceRefreshAll` to recalculate everything, e.g. for fresh traffic or timetable data.
 - The "arrive by" time in Google Maps links uses Google's undocumented URL format; if Google changes it, the link still opens the right route, just without the time.
 
 ## License

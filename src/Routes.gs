@@ -28,6 +28,7 @@ function calculateAllRoutes(origin, destination, targetTime, isDepartureTime) {
     } catch (e) {
       console.warn(`  -> ${key} route failed: ${e}`);
       results[key] = null;
+      failedRequests++;
     }
   });
 
@@ -36,6 +37,7 @@ function calculateAllRoutes(origin, destination, targetTime, isDepartureTime) {
   } catch (e) {
     console.warn(`  -> NS route failed: ${e}`);
     results.NS = null;
+    failedRequests++;
   }
 
   return results;

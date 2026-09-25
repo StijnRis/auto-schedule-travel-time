@@ -28,7 +28,7 @@ const CONFIG = {
   NS_API_KEY: '', // Script Property: NS_API_KEY
 
   TIME_ZONE: '',                        // '' = the script time zone (appsscript.json)
-  SEARCH_RANGE_DAYS: 7,                 // Lookahead window in days
+  SEARCH_RANGE_DAYS: 14,                // Lookahead window in days
   MAX_GAP_BEFORE_HOME_HOURS: 10,        // Max gap between events before assuming you went home in between
   ARRIVAL_BUFFER_MINUTES: 5,            // Default: arrive this many minutes before an event starts
   MIN_TRAVEL_DURATION_SEC: 180,         // Ignore trips shorter than 3 minutes

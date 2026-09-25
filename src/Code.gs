@@ -12,6 +12,13 @@
  */
 
 const SOURCE_TAG = 'SOURCE_EVENT_ID';
+const STATE_PREFIX = 'TRAVEL_STATE_';
+const MAX_RUNTIME_MS = 5 * 60 * 1000; // Apps Script stops a run after 6 minutes
+// Bump when the travel block output changes, so every block gets recreated once.
+const SCRIPT_VERSION = 2;
+
+// Route requests / block creations that failed during this run.
+let failedRequests = 0;
 
 /**
  * Main Trigger Function
@@ -44,21 +51,41 @@ function installTriggers() {
  * Main Orchestrator Logic
  */
 function processTravelBlocks() {
+  const deadline = Date.now() + MAX_RUNTIME_MS;
   applyLocalConfig();
   // Calendar triggers can fire in quick succession; never run two scans at once.
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(4 * 60 * 1000)) {
+  if (!lock.tryLock(3 * 60 * 1000)) {
     console.log('Another scan is still running; skipping this one.');
     return;
   }
   try {
-    runScan();
+    runScan(deadline);
   } finally {
     lock.releaseLock();
   }
 }
 
-function runScan() {
+/**
+ * Forgets which events were already processed, so every travel block is recalculated.
+ */
+function forceRefreshAll() {
+  const props = PropertiesService.getScriptProperties();
+  props.getKeys().filter(k => k.startsWith(STATE_PREFIX)).forEach(k => props.deleteProperty(k));
+  processTravelBlocks();
+}
+
+/**
+ * Picks up where a scan left off when it ran out of time.
+ */
+function continueProcessing() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'continueProcessing')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  processTravelBlocks();
+}
+
+function runScan(deadline) {
   const targetCalendarId = getSetting('TARGET_CALENDAR_ID');
   const targetCalendar = CalendarApp.getCalendarById(targetCalendarId);
   if (!targetCalendar) {
@@ -77,88 +104,146 @@ function runScan() {
   // Clean up travel blocks whose source events were deleted
   cleanupOrphanedTravelBlocks(existingBlocks, sourceEvents, now, future);
 
+  const props = PropertiesService.getScriptProperties();
+  const configFingerprint = getConfigFingerprint();
+  let unchanged = 0;
+
   for (let i = 0; i < sourceEvents.length; i++) {
+    if (Date.now() > deadline) {
+      console.warn(`\nOut of time; the remaining ${sourceEvents.length - i} events continue in a minute.`);
+      scheduleContinuation();
+      break;
+    }
+
     const currentEvent = sourceEvents[i];
     const eventKey = getEventKey(currentEvent);
-    const title = currentEvent.getTitle();
-    const location = currentEvent.resolvedLocation;
-    const startTime = currentEvent.getStartTime();
+    const existing = existingBlocks.get(eventKey) || [];
+    const plan = planTrip(sourceEvents, i);
 
-    console.log(`\n[Processing] "${title}" (${startTime.toLocaleString()})`);
-    console.log(`  -> Resolved Location: "${location || 'None'}"`);
-
-    // Remove existing travel blocks for this event so they get recalculated cleanly
-    deleteBlocks(existingBlocks.get(eventKey), `REFRESH: Removing old travel block for "${title}"`);
-
-    if (!location) {
-      console.log(`  -> SKIP: No location specified or resolved from defaults.`);
+    // Keep the existing blocks when nothing that affects the trip has changed.
+    const stateKey = getStateKey(eventKey);
+    const hash = shortHash(JSON.stringify([plan, configFingerprint]), 24);
+    const previous = JSON.parse(props.getProperty(stateKey) || 'null');
+    if (previous && previous.hash === hash && previous.blocks === existing.length) {
+      unchanged++;
       continue;
     }
 
-    // Evaluate special keyword rules (e.g. Flight / Vlucht / Vliegen)
-    const ruleMatch = getMatchingRule(title);
-    const arrivalBufferMins = ruleMatch ? ruleMatch.arrivalBufferMinutes : CONFIG.ARRIVAL_BUFFER_MINUTES;
-    const disableReturnHome = ruleMatch ? ruleMatch.disableReturnHome : false;
+    console.log(`\n[Processing] "${currentEvent.getTitle()}" (${currentEvent.getStartTime().toLocaleString()})`);
+    console.log(`  -> Resolved Location: "${plan.destination || 'None'}"`);
 
-    if (ruleMatch) {
-      console.log(`  -> SPECIAL RULE MATCHED: Buffer set to ${arrivalBufferMins} mins | Disable Return: ${disableReturnHome}`);
+    // Remove existing travel blocks for this event so they get recalculated cleanly
+    deleteBlocks(existing, 'REFRESH: Removing old travel block');
+
+    const failuresBefore = failedRequests;
+    const created = createBlocksForPlan(targetCalendar, eventKey, plan);
+
+    // Only remember the result when everything worked, so failures are retried next run.
+    if (failedRequests === failuresBefore) {
+      props.setProperty(stateKey, JSON.stringify({ hash, blocks: created }));
+    } else {
+      props.deleteProperty(stateKey);
+      console.warn('  -> Some requests failed; this event will be retried on the next run.');
     }
+  }
 
-    const { origin, originSource } = determineOrigin(sourceEvents, i);
-    const arrivalTime = new Date(startTime.getTime() - (arrivalBufferMins * 60 * 1000));
+  pruneState(props, sourceEvents);
+  console.log(`\n=== END SCAN (${unchanged} unchanged events skipped) ===`);
+}
 
-    const routes = calculateAllRoutes(origin, location, arrivalTime, false);
-    const selectedRoute = selectBestTravelMode(routes);
+/**
+ * Everything that determines an event's travel blocks. As long as this stays the
+ * same, the existing blocks are kept.
+ */
+function planTrip(sourceEvents, index) {
+  const event = sourceEvents[index];
+  const destination = event.resolvedLocation;
+  if (!destination) return { destination: '' };
 
-    if (!isUsableRoute(selectedRoute, '')) continue;
+  // Evaluate special keyword rules (e.g. Flight / Vlucht / Vliegen)
+  const ruleMatch = getMatchingRule(event.getTitle());
+  const bufferMins = ruleMatch ? ruleMatch.arrivalBufferMinutes : CONFIG.ARRIVAL_BUFFER_MINUTES;
+  const disableReturnHome = ruleMatch ? ruleMatch.disableReturnHome : false;
+  const { origin, originSource } = determineOrigin(sourceEvents, index);
+  const planReturn = !disableReturnHome && isLastEventOfDay(sourceEvents, index);
 
-    // Create Outbound Travel Block
-    createTravelBlock({
+  return {
+    destination,
+    origin,
+    originSource,
+    ruleMatched: Boolean(ruleMatch),
+    bufferMins,
+    disableReturnHome,
+    arrivalTime: event.getStartTime().getTime() - (bufferMins * 60 * 1000),
+    returnStart: planReturn ? event.getEndTime().getTime() : null,
+    home: planReturn ? getSetting('HOME_LOCATION') : null
+  };
+}
+
+/**
+ * Creates the outbound (and, if needed, return) travel block. Returns how many were created.
+ */
+function createBlocksForPlan(targetCalendar, eventKey, plan) {
+  if (!plan.destination) {
+    console.log(`  -> SKIP: No location specified or resolved from defaults.`);
+    return 0;
+  }
+
+  if (plan.ruleMatched) {
+    console.log(`  -> SPECIAL RULE MATCHED: Buffer set to ${plan.bufferMins} mins | Disable Return: ${plan.disableReturnHome}`);
+  }
+
+  let created = 0;
+  const arrivalTime = new Date(plan.arrivalTime);
+  const routes = calculateAllRoutes(plan.origin, plan.destination, arrivalTime, false);
+  const selectedRoute = selectBestTravelMode(routes);
+
+  // Create Outbound Travel Block
+  if (isUsableRoute(selectedRoute, '')) {
+    const ok = createTravelBlock({
       targetCalendar,
       eventKey,
       isReturn: false,
-      origin,
-      destination: location,
-      originSource,
+      origin: plan.origin,
+      destination: plan.destination,
+      originSource: plan.originSource,
       start: selectedRoute.departureTime || new Date(arrivalTime.getTime() - (selectedRoute.durationSec * 1000)),
       end: arrivalTime,
       selectedRoute,
       routes,
-      bufferMins: arrivalBufferMins
+      bufferMins: plan.bufferMins
     });
-
-    // Handle Return Travel Block if last event of the day AND return is not disabled by a rule
-    if (disableReturnHome) {
-      console.log(`  -> SKIP RETURN: Return travel disabled by special rule for "${title}".`);
-    } else if (isLastEventOfDay(sourceEvents, i)) {
-      handleReturnTravel(targetCalendar, currentEvent);
-    }
+    if (ok) created++;
   }
 
-  console.log(`\n=== END SCAN ===`);
+  // Handle Return Travel Block if last event of the day AND return is not disabled by a rule
+  if (plan.disableReturnHome) {
+    console.log(`  -> SKIP RETURN: Return travel disabled by special rule.`);
+  } else if (plan.returnStart && handleReturnTravel(targetCalendar, eventKey, plan)) {
+    created++;
+  }
+  return created;
 }
 
 /**
  * Handles generating a return travel block back home for the last event of the day
  */
-function handleReturnTravel(targetCalendar, currentEvent) {
-  const location = currentEvent.resolvedLocation;
-  const endTime = currentEvent.getEndTime();
-  const home = getSetting('HOME_LOCATION');
+function handleReturnTravel(targetCalendar, eventKey, plan) {
+  const endTime = new Date(plan.returnStart);
 
   console.log(`  -> CHECKING RETURN: Last event of day. Processing return home...`);
 
-  const returnRoutes = calculateAllRoutes(location, home, endTime, true);
+  const returnRoutes = calculateAllRoutes(plan.destination, plan.home, endTime, true);
   const selectedRoute = selectBestTravelMode(returnRoutes);
 
-  if (!isUsableRoute(selectedRoute, ' (Return)')) return;
+  if (!isUsableRoute(selectedRoute, ' (Return)')) return false;
 
-  createTravelBlock({
+  return createTravelBlock({
     targetCalendar,
-    eventKey: getEventKey(currentEvent),
+    eventKey,
     isReturn: true,
-    origin: location,
-    destination: home,
+    origin: plan.destination,
+    destination: plan.home,
     originSource: 'Last Event Location',
     start: endTime,
     end: selectedRoute.arrivalTime || new Date(endTime.getTime() + (selectedRoute.durationSec * 1000)),
@@ -208,10 +293,12 @@ function getEventKey(event) {
  * Returns a Map of event key -> travel blocks created for that event.
  */
 function indexTravelBlocks(targetCalendar, windowStart, windowEnd) {
+  // Look back a day: blocks for upcoming events may already have started or ended.
+  const searchStart = new Date(windowStart.getTime() - (24 * 60 * 60 * 1000));
   const searchEnd = new Date(windowEnd.getTime() + (24 * 60 * 60 * 1000));
   const index = new Map();
 
-  targetCalendar.getEvents(windowStart, searchEnd).forEach(evt => {
+  targetCalendar.getEvents(searchStart, searchEnd).forEach(evt => {
     const key = evt.getTag(SOURCE_TAG);
     if (!key) return;
     if (!index.has(key)) index.set(key, []);
@@ -244,7 +331,43 @@ function deleteBlocks(blocks, message) {
   });
 }
 
+/**
+ * Script Property that stores the trip hash and block count of an event.
+ */
+function getStateKey(eventKey) {
+  return STATE_PREFIX + shortHash(eventKey, 24);
+}
+
+/**
+ * Removes stored hashes of events that are no longer in the scan window.
+ */
+function pruneState(props, sourceEvents) {
+  const current = new Set(sourceEvents.map(e => getStateKey(getEventKey(e))));
+  props.getKeys()
+    .filter(k => k.startsWith(STATE_PREFIX) && !current.has(k))
+    .forEach(k => props.deleteProperty(k));
+}
+
+/**
+ * Settings that affect every travel block; changing any of them refreshes all blocks.
+ */
+function getConfigFingerprint() {
+  return JSON.stringify([SCRIPT_VERSION, CONFIG, getSetting('HOME_LOCATION'), Boolean(getSetting('NS_API_KEY'))]);
+}
+
+function scheduleContinuation() {
+  const alreadyScheduled = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'continueProcessing');
+  if (!alreadyScheduled) {
+    ScriptApp.newTrigger('continueProcessing').timeBased().after(60 * 1000).create();
+  }
+}
+
 // --- HELPER FUNCTIONS ---
+
+function shortHash(text, length) {
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
+  return Utilities.base64EncodeWebSafe(digest).substring(0, length);
+}
 
 /**
  * Merges LOCAL_CONFIG (from the optional, git-ignored Config.local.gs) into CONFIG.
@@ -375,8 +498,11 @@ function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destina
     newEvent.setTag(SOURCE_TAG, eventKey);
 
     console.log(`  -> CREATED: "${eventTitle}" [${start.toLocaleTimeString()} - ${end.toLocaleTimeString()}]`);
+    return true;
   } catch (e) {
     console.error(`  -> ERROR: Failed to create event: ${e}`);
+    failedRequests++;
+    return false;
   }
 }
 

@@ -45,6 +45,7 @@ function getNsRoute(origin, destination, targetTime, isDepartureTime) {
 
   if (response.getResponseCode() !== 200) {
     console.warn(`  -> NS API error [HTTP ${response.getResponseCode()}]: ${response.getContentText().substring(0, 300)}`);
+    failedRequests++;
     return null;
   }
 
@@ -150,8 +151,7 @@ function formatNsDateTime(date) {
  */
 function geocodeAddress(address) {
   const cache = CacheService.getScriptCache();
-  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, address, Utilities.Charset.UTF_8);
-  const cacheKey = `geo_${Utilities.base64EncodeWebSafe(digest)}`;
+  const cacheKey = `geo_${shortHash(address, 32)}`;
 
   const cached = cache.get(cacheKey);
   if (cached) return JSON.parse(cached);
