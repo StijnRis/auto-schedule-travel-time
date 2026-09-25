@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auto Schedule Travel Time · Google Calendar travel blocks</title>
+  <meta name="description" content="A free Google Apps Script that adds travel blocks to your Google Calendar: when to leave and how to get there, by foot, bike, public transport, NS train or car.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚲</text></svg>">
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --surface: #ffffff;
+      --text: #1d2330;
+      --muted: #5d6679;
+      --border: #e2e6ee;
+      --accent: #1a73e8;
+      --accent-soft: #e8f0fe;
+      --event: #33b679;
+      --travel: #7986cb;
+      --radius: 14px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11141a;
+        --surface: #1a1f28;
+        --text: #e6e9ef;
+        --muted: #9aa3b5;
+        --border: #2b3240;
+        --accent: #8ab4f8;
+        --accent-soft: #1e2a3d;
+        --event: #2e8b62;
+        --travel: #5c6bc0;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    a { color: var(--accent); }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+    header.hero { padding: 72px 0 48px; }
+    .hero-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 48px; align-items: center; }
+    h1 { font-size: clamp(2rem, 4.5vw, 3rem); line-height: 1.15; margin: 0 0 16px; letter-spacing: -0.02em; }
+    h2 { font-size: 1.75rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+    .lead { font-size: 1.15rem; color: var(--muted); margin: 0 0 28px; }
+    .buttons { display: flex; gap: 12px; flex-wrap: wrap; }
+    .btn {
+      display: inline-block; padding: 12px 20px; border-radius: 999px;
+      font-weight: 600; text-decoration: none; border: 1px solid var(--border);
+      color: var(--text); background: var(--surface);
+    }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    @media (prefers-color-scheme: dark) { .btn.primary { color: #11141a; } }
+
+    /* Calendar mockup */
+    .calendar {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 16px; box-shadow: 0 12px 40px rgba(20, 30, 60, 0.08);
+    }
+    .cal-head { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.85rem; margin-bottom: 8px; }
+    .cal-body { position: relative; height: 360px; border-left: 1px solid var(--border); margin-left: 44px; }
+    .hour { position: absolute; left: -44px; right: 0; border-top: 1px solid var(--border); font-size: 0.72rem; color: var(--muted); }
+    .hour span { position: absolute; top: -9px; width: 38px; text-align: right; background: var(--surface); }
+    .block {
+      position: absolute; left: 8px; right: 8px; border-radius: 8px; padding: 6px 10px;
+      color: #fff; font-size: 0.8rem; line-height: 1.3; overflow: hidden;
+    }
+    .block b { display: block; font-size: 0.85rem; }
+    .block.event { background: var(--event); }
+    .block.travel { background: var(--travel); }
+
+    section { padding: 56px 0; }
+    .section-intro { color: var(--muted); margin: 0 0 32px; max-width: 640px; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; }
+    .card .icon { font-size: 1.6rem; }
+    .card h3 { margin: 8px 0 6px; font-size: 1.05rem; }
+    .card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
+    .event-detail { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; font-size: 0.92rem; }
+    .event-detail .title { font-size: 1.2rem; font-weight: 700; margin-bottom: 4px; }
+    .event-detail .time { color: var(--muted); margin-bottom: 14px; }
+    .event-detail ul { list-style: none; padding: 0; margin: 8px 0 0; }
+    .event-detail li { padding: 4px 0; }
+    .tag { font-size: 0.75rem; background: var(--accent-soft); color: var(--accent); padding: 2px 8px; border-radius: 999px; margin-left: 6px; }
+
+    ol.steps { counter-reset: step; list-style: none; padding: 0; margin: 0; }
+    ol.steps li { counter-increment: step; position: relative; padding: 0 0 22px 52px; }
+    ol.steps li::before {
+      content: counter(step); position: absolute; left: 0; top: 0; width: 34px; height: 34px;
+      border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+      display: grid; place-items: center; font-weight: 700;
+    }
+    ol.steps h3 { margin: 4px 0; font-size: 1.05rem; }
+    ol.steps p { margin: 0; color: var(--muted); }
+    code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.9em; background: var(--accent-soft); padding: 1px 6px; border-radius: 6px; }
+    pre {
+      background: #0f1420; color: #d7deea; border-radius: var(--radius); padding: 20px;
+      overflow-x: auto; font-size: 0.85rem; line-height: 1.5; margin: 0;
+    }
+    pre code { background: none; padding: 0; color: inherit; }
+    .c { color: #7f8ba3; }
+    .s { color: #a5d6a7; }
+    .n { color: #ffcc80; }
+
+    .flow { display: flex; flex-direction: column; gap: 10px; }
+    .flow div { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; }
+
+    footer { border-top: 1px solid var(--border); padding: 28px 0 40px; color: var(--muted); font-size: 0.9rem; }
+    footer .wrap { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+
+    @media (max-width: 820px) {
+      .hero-grid, .split { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr; }
+      header.hero { padding-top: 48px; }
+    }
+  </style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <h1>Never forget to leave on time again.</h1>
+      <p class="lead">
+        A free Google Apps Script that reads your Google Calendar and adds a
+        <strong>travel block</strong> before every event: when to leave, and whether to walk,
+        bike, take public transport (including <strong>NS</strong> trains) or drive.
+      </p>
+      <div class="buttons">
+        <a class="btn primary" href="https://github.com/StijnRis/auto-schedule-travel-time">View on GitHub</a>
+        <a class="btn" href="#setup">Set it up in 5 minutes</a>
+      </div>
+    </div>
+
+    <div class="calendar" aria-label="Example calendar with travel blocks">
+      <div class="cal-head"><span>Tuesday</span><span>Travel calendar + your calendar</span></div>
+      <div class="cal-body">
+        <div class="hour" style="top: 0"><span>08:00</span></div>
+        <div class="hour" style="top: 60px"><span>09:00</span></div>
+        <div class="hour" style="top: 120px"><span>10:00</span></div>
+        <div class="hour" style="top: 180px"><span>11:00</span></div>
+        <div class="hour" style="top: 240px"><span>12:00</span></div>
+        <div class="hour" style="top: 300px"><span>13:00</span></div>
+
+        <div class="block travel" style="top: 25px; height: 30px;"><b>🚆 Leave 08:25 · NS</b></div>
+        <div class="block event" style="top: 60px; height: 90px;"><b>Lecture</b>Main Building, Delft</div>
+        <div class="block travel" style="top: 150px; height: 20px; padding-top: 2px;"><b>🚶 Leave 10:30 · Walking</b></div>
+        <div class="block event" style="top: 172px; height: 88px;"><b>Project meeting</b>Library, Delft</div>
+        <div class="block travel" style="top: 262px; height: 34px;"><b>🚲 Leave 12:20 · Biking home</b></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="section-intro">Put a location on your events and the script handles the rest. It runs automatically whenever your calendar changes.</p>
+    <div class="cards">
+      <div class="card">
+        <div class="icon">⏰</div>
+        <h3>Tells you when to leave</h3>
+        <p>Every travel block is titled like <code>🚲 Leave 08:42 · Biking</code>, so a glance at your calendar or a notification is enough.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🧭</div>
+        <h3>Picks the best way</h3>
+        <p>Compares walking, biking, public transport, NS and driving. Short trips are walked, medium ones biked, and otherwise the fastest option wins.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🚆</div>
+        <h3>NS journey planner</h3>
+        <p>In the Netherlands, it plans door-to-door journeys with the official NS API: trains, tracks, transfers, fares and crowd forecasts.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔗</div>
+        <h3>One tap to directions</h3>
+        <p>Every travel option is a link that opens that exact mode in Google Maps with <em>arrive by</em> set to your event, so traffic and timetables are right.</p>
+      </div>
+      <div class="card">
+        <div class="icon">📍</div>
+        <h3>Knows where you are</h3>
+        <p>Back-to-back events? It routes from your previous event. Long gap? It assumes you went home. After the last event it plans your trip home.</p>
+      </div>
+      <div class="card">
+        <div class="icon">✈️</div>
+        <h3>Custom rules</h3>
+        <p>Keyword rules like "arrive 2 hours early for anything titled <em>flight</em>, and don't plan a return trip".</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap split">
+    <div>
+      <h2>Everything in the event</h2>
+      <p class="section-intro">Open a travel block to see all options side by side. Each one is a link to that specific travel mode, and the chosen route comes with step-by-step directions.</p>
+      <div class="flow">
+        <div>1. Collect events from your calendars for the next 7 days</div>
+        <div>2. Work out where you're coming from (home or the previous event)</div>
+        <div>3. Ask Google Maps and NS for every travel mode, arriving on time</div>
+        <div>4. Pick the best mode and write a travel block to your travel calendar</div>
+        <div>5. Clean up blocks for moved or deleted events</div>
+      </div>
+    </div>
+    <div class="event-detail" aria-label="Example travel event description">
+      <div class="title">🚆 Leave 08:25 · NS</div>
+      <div class="time">Tuesday · 08:25 – 08:55</div>
+      <div>📍 <a href="#" onclick="return false">Open NS Journey Planner</a></div>
+      <p><b>Route:</b> Home ➔ Main Building, Delft<br><b>Duration:</b> 28 mins, 0 transfer(s)</p>
+      <b>📊 Travel Options Comparison:</b>
+      <ul>
+        <li>🚶 <a href="#" onclick="return false">Walking</a>: <b>1 hour 20 mins</b></li>
+        <li>🚲 <a href="#" onclick="return false">Biking</a>: <b>42 mins</b></li>
+        <li>🚌 <a href="#" onclick="return false">Transit</a>: <b>31 mins</b>, leave 08:22</li>
+        <li>🚆 <a href="#" onclick="return false">NS</a>: <b>28 mins</b>, leave 08:25 (€3.40) <span class="tag">chosen</span></li>
+        <li>🚗 <a href="#" onclick="return false">Driving</a>: <b>24 mins</b></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="setup">
+  <div class="wrap split">
+    <div>
+      <h2>Set it up</h2>
+      <p class="section-intro">No servers, no subscriptions. It runs in your own Google account.</p>
+      <ol class="steps">
+        <li>
+          <h3>Create a travel calendar</h3>
+          <p>In Google Calendar, add a new calendar called "Travel" and copy its Calendar ID (Settings → Integrate calendar).</p>
+        </li>
+        <li>
+          <h3>Copy the script</h3>
+          <p>Create a project on <a href="https://script.google.com/">script.google.com</a> and add the files from the <a href="https://github.com/StijnRis/auto-schedule-travel-time/tree/main/src"><code>src</code> folder</a>.</p>
+        </li>
+        <li>
+          <h3>Add your details</h3>
+          <p>Under Project Settings → Script Properties, add <code>TARGET_CALENDAR_ID</code>, <code>HOME_LOCATION</code> and optionally <code>NS_API_KEY</code> (free at <a href="https://apiportal.ns.nl/">apiportal.ns.nl</a>).</p>
+        </li>
+        <li>
+          <h3>Run it</h3>
+          <p>Run <code>processTravelBlocks</code> once to grant permissions, then <code>installTriggers</code> to keep it running automatically.</p>
+        </li>
+      </ol>
+    </div>
+    <div>
+      <h2>Make it yours</h2>
+      <p class="section-intro">Everything is configured in <code>Config.gs</code>.</p>
+<pre><code><span class="c">// When to walk or bike</span>
+MODE_SELECTION: {
+  walkIfUnderMinutes: <span class="n">15</span>,
+  bikeIfUnderMinutes: <span class="n">40</span>,
+  allowDriving: <span class="n">false</span>
+},
+
+<span class="c">// Arrive 5 minutes early by default</span>
+ARRIVAL_BUFFER_MINUTES: <span class="n">5</span>,
+
+<span class="c">// Special rules by keyword</span>
+SPECIAL_RULES: [
+  {
+    keywords: [<span class="s">'flight'</span>, <span class="s">'vlucht'</span>],
+    arrivalBufferMinutes: <span class="n">120</span>,
+    disableReturnHome: <span class="n">true</span>
+  }
+]</code></pre>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Auto Schedule Travel Time · MIT licensed</span>
+    <a href="https://github.com/StijnRis/auto-schedule-travel-time">Source on GitHub</a>
+  </div>
+</footer>
+
+</body>
+</html>
