@@ -5,3 +5,5 @@ src/Config.local.gs
 
 .DS_Store
 Thumbs.db
+
+node_modules/
