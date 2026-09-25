@@ -1,7 +1,7 @@
-# clasp project link (contains your personal script ID)
-.clasp.json
-.clasprc.json
+# Personal configuration
+src/Config.local.gs
+*.local.gs
+!Config.local.example.gs
 
-node_modules/
 .DS_Store
 Thumbs.db

@@ -18,7 +18,7 @@ A Google Apps Script that reads your Google Calendar and automatically adds **tr
 
 1. Create a new calendar in Google Calendar, e.g. "Travel". Copy its **Calendar ID** (Settings → Integrate calendar).
 2. Go to [script.google.com](https://script.google.com/) and create a new project.
-3. Copy every file from [`src/`](src/) into the project (`Config.gs`, `Code.gs`, `Routes.gs`, `NsApi.gs`). Optionally replace `appsscript.json` (Project Settings → Show "appsscript.json" manifest file) to set your time zone.
+3. Copy every file from [`src/`](src/) into the project (`Config.gs`, `Code.gs`, `Routes.gs`, `NsApi.gs`), keeping the file names. Optionally replace `appsscript.json` (Project Settings → Show "appsscript.json" manifest file) to set your time zone.
 4. Configure it: either edit `Config.gs`, or (recommended) add these **Script Properties** under Project Settings → Script Properties:
 
    | Property             | Example                                        |
@@ -38,18 +38,9 @@ Sign up at [apiportal.ns.nl](https://apiportal.ns.nl/), subscribe to the **Ns-Ap
 
 All options live in [`src/Config.gs`](src/Config.gs) and are documented inline: source calendars, arrival buffer, when to walk or bike, whether driving is allowed, NS preferences and keyword rules.
 
-## Developing with clasp
+### Keeping your personal config in a local clone
 
-This repo uses [clasp](https://github.com/google/clasp) to sync with Apps Script:
-
-```sh
-npm install -g @google/clasp
-clasp login
-cp .clasp.json.example .clasp.json   # then fill in your script ID (Project Settings → IDs)
-clasp pull   # or: clasp push
-```
-
-`.clasp.json` is git-ignored so your script ID stays private. Keep personal values in Script Properties so `Config.gs` can be committed as-is.
+Copy [`Config.local.example.gs`](Config.local.example.gs) to `src/Config.local.gs` and fill in your details. That file is git-ignored, so it never ends up on GitHub. Add it to your Apps Script project as an extra file named `Config.local`; its values override `Config.gs`.
 
 ## Notes
 

@@ -25,6 +25,7 @@ function onCalendarChange() {
  * lookahead window moving. Safe to run again; it replaces its own triggers.
  */
 function installTriggers() {
+  applyLocalConfig();
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'onCalendarChange')
     .forEach(t => ScriptApp.deleteTrigger(t));
@@ -43,6 +44,7 @@ function installTriggers() {
  * Main Orchestrator Logic
  */
 function processTravelBlocks() {
+  applyLocalConfig();
   // Calendar triggers can fire in quick succession; never run two scans at once.
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(4 * 60 * 1000)) {
@@ -245,9 +247,24 @@ function deleteBlocks(blocks, message) {
 // --- HELPER FUNCTIONS ---
 
 /**
+ * Merges LOCAL_CONFIG (from the optional, git-ignored Config.local.gs) into CONFIG.
+ * Done at runtime so it works no matter in which order the files are loaded.
+ */
+function applyLocalConfig() {
+  if (CONFIG._localApplied || typeof LOCAL_CONFIG === 'undefined') return;
+  Object.keys(LOCAL_CONFIG).forEach(key => {
+    const value = LOCAL_CONFIG[key];
+    const isPlainObject = value && typeof value === 'object' && !Array.isArray(value);
+    CONFIG[key] = isPlainObject ? Object.assign({}, CONFIG[key], value) : value;
+  });
+  CONFIG._localApplied = true;
+}
+
+/**
  * Reads a setting from Script Properties, falling back to CONFIG.
  */
 function getSetting(name) {
+  applyLocalConfig();
   const value = PropertiesService.getScriptProperties().getProperty(name);
   return value ? value : CONFIG[name];
 }
