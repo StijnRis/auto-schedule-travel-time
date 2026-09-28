@@ -9,4 +9,14 @@ const LOCAL_CONFIG = {
   TARGET_CALENDAR_ID: 'your-travel-calendar-id@group.calendar.google.com',
   HOME_LOCATION: 'Your Street 1, Your City, Country',
   NS_API_KEY: ''
+
+  // Any other option from Config.gs can be set here too, for example:
+  // SOURCE_CALENDARS: [
+  //   {
+  //     id: 'your-timetable-id@import.calendar.google.com',
+  //     locationReplace: [{ find: /\s*-.*$/, replace: '' }],  // Drop everything from the first '-'
+  //     locationPrefix: 'My University, '
+  //   }
+  // ],
+  // MAX_TRAVEL_HOURS: 6
 };

@@ -1,11 +1,10 @@
 /**
- * Configuration for the Travel Time script.
+ * Configuration for the Travel Time script: every option with its default.
  *
- * Personal values (TARGET_CALENDAR_ID, HOME_LOCATION, NS_API_KEY) are best stored
- * as Script Properties instead of in this file:
- *   Apps Script editor → Project Settings (⚙️) → Script Properties → Add property.
- * A Script Property with the same name always wins over the value below, so this
- * file can stay free of personal details (handy if you keep it in a public repo).
+ * Don't change these here (an update would overwrite them). Put the options you
+ * want to change in a separate file named Config.local (see Config.local.example.gs),
+ * or set TARGET_CALENDAR_ID, HOME_LOCATION and NS_API_KEY as Script Properties
+ * (Project Settings → Script Properties). A Script Property always wins.
  */
 const CONFIG = {
   // Read events from every calendar that is enabled (checked) in Google Calendar.
@@ -17,7 +16,10 @@ const CONFIG = {
   SOURCE_CALENDARS: [
     // {
     //   id: 'primary',          // 'primary' or a calendar ID (Calendar settings → Integrate calendar)
-    //   locationPrefix: '',     // Prepended to every location, e.g. 'My University, ' when events only list a room
+    //   locationReplace: [      // Rewrite locations with regular expressions, applied in order
+    //     { find: /\s*-.*$/, replace: '' }   // e.g. drop everything from the first '-'
+    //   ],
+    //   locationPrefix: '',     // Prepended to every location (after locationReplace), e.g. 'My University, ' when events only list a room
     //   defaultLocation: ''     // Used when an event has no location at all ('' = skip those events)
     // }
   ],
@@ -38,6 +40,7 @@ const CONFIG = {
   MAX_GAP_BEFORE_HOME_HOURS: 10,        // Max gap between events before assuming you went home in between
   ARRIVAL_BUFFER_MINUTES: 5,            // Default: arrive this many minutes before an event starts
   MIN_TRAVEL_DURATION_SEC: 180,         // Ignore trips shorter than 3 minutes
+  MAX_TRAVEL_HOURS: 4,                  // No block for longer trips (usually a wrong location); logs a warning
   API_DELAY_MS: 150,                    // Pause between Maps API calls to avoid rate limit errors
   SKIP_DECLINED_EVENTS: true,           // Don't plan travel for events you declined
 

@@ -5,42 +5,59 @@
  * telling you when to leave and how to get there: walking, biking, public transport
  * (Google Maps and NS) or driving. It keeps track of where your bike is.
  *
- * Setup:
- * 1. Add all .gs files from this project to a new project on https://script.google.com/
- * 2. Fill in Config.gs (or set TARGET_CALENDAR_ID, HOME_LOCATION and NS_API_KEY as Script Properties).
- * 3. Run installTriggers() once, or run processTravelBlocks() manually.
+ * Setup: paste this script into a project on https://script.google.com/, add your
+ * settings (a Config.local file or Script Properties, see the README) and run
+ * syncTravel once. It installs its own triggers and keeps them up to date.
  */
+
+/**
+ * Run this. Updates the travel blocks and makes sure the triggers that keep them
+ * up to date (a calendar change, and once a day) are installed.
+ */
+function syncTravel() {
+  applyLocalConfig();
+  try {
+    ensureTriggers();
+  } catch (e) {
+    console.warn(`Could not update triggers: ${e}`);
+  }
+  processTravelBlocks();
+}
 
 const SOURCE_TAG = 'SOURCE_EVENT_ID';
 const STATE_PREFIX = 'TRAVEL_STATE_';
 const MAX_RUNTIME_MS = 5 * 60 * 1000; // Apps Script stops a run after 6 minutes
 const CODE_FINGERPRINT_KEY = 'CODE_FINGERPRINT';
 const MAX_CALENDAR_TRIGGERS = 15;      // Apps Script allows 20 triggers per script
+const TRIGGER_HANDLER = 'syncTravel';
+const LEGACY_TRIGGER_HANDLERS = ['onCalendarChange'];
 
 // Route requests / block creations that failed during this run.
 let failedRequests = 0;
 
-/**
- * Main Trigger Function
- */
+/** Kept so triggers installed by older versions still work until they are replaced. */
 function onCalendarChange() {
-  processTravelBlocks();
+  syncTravel();
 }
 
 /**
  * Installs a trigger on every source calendar plus a daily run that keeps the
- * lookahead window moving. Safe to run again; it replaces its own triggers.
+ * lookahead window moving. Cheap when nothing changed, so it runs every time.
  */
-function installTriggers() {
-  applyLocalConfig();
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'onCalendarChange')
+function ensureTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers
+    .filter(t => LEGACY_TRIGGER_HANDLERS.includes(t.getHandlerFunction()))
     .forEach(t => ScriptApp.deleteTrigger(t));
 
-  syncCalendarTriggers(getSourceCalendars().map(s => s.calendar.getId()));
+  const hasDaily = triggers.some(t =>
+    t.getHandlerFunction() === TRIGGER_HANDLER && t.getEventType() === ScriptApp.EventType.CLOCK);
+  if (!hasDaily) {
+    ScriptApp.newTrigger(TRIGGER_HANDLER).timeBased().everyDays(1).atHour(5).create();
+    console.log('Installed daily trigger (around 05:00).');
+  }
 
-  ScriptApp.newTrigger('onCalendarChange').timeBased().everyDays(1).atHour(5).create();
-  console.log('Installed daily trigger (around 05:00).');
+  syncCalendarTriggers(getSourceCalendars().map(s => s.calendar.getId()));
 }
 
 /**
@@ -55,7 +72,7 @@ function syncCalendarTriggers(calendarIds) {
 
   const installed = new Set();
   ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'onCalendarChange' && t.getEventType() === ScriptApp.EventType.ON_EVENT_UPDATED)
+    .filter(t => t.getHandlerFunction() === TRIGGER_HANDLER && t.getEventType() === ScriptApp.EventType.ON_EVENT_UPDATED)
     .forEach(t => {
       const id = t.getTriggerSourceId();
       if (wanted.includes(id) && !installed.has(id)) {
@@ -68,7 +85,7 @@ function syncCalendarTriggers(calendarIds) {
 
   wanted.filter(id => !installed.has(id)).forEach(id => {
     try {
-      ScriptApp.newTrigger('onCalendarChange').forUserCalendar(id).onEventUpdated().create();
+      ScriptApp.newTrigger(TRIGGER_HANDLER).forUserCalendar(id).onEventUpdated().create();
       console.log(`Installed calendar trigger for ${id}`);
     } catch (e) {
       console.warn(`Could not install a trigger for calendar ${id}: ${e}`);
@@ -118,7 +135,7 @@ function runScan(deadline) {
   const targetCalendarId = getSetting('TARGET_CALENDAR_ID');
   const targetCalendar = CalendarApp.getCalendarById(targetCalendarId);
   if (!targetCalendar) {
-    console.error(`Target calendar not found: ${targetCalendarId}. Set TARGET_CALENDAR_ID in Config.gs or as a Script Property.`);
+    console.error(`Target calendar not found: ${targetCalendarId}. Set TARGET_CALENDAR_ID in your Config.local file or as a Script Property.`);
     return;
   }
 
@@ -127,11 +144,6 @@ function runScan(deadline) {
 
   const sources = getSourceCalendars();
   console.log(`Reading ${sources.length} calendar(s): ${sources.map(s => s.calendar.getName()).join(', ')}`);
-  try {
-    syncCalendarTriggers(sources.map(s => s.calendar.getId()));
-  } catch (e) {
-    console.warn(`Could not update calendar triggers: ${e}`);
-  }
 
   const { events: sourceEvents, homes } = fetchAndMergeSourceEvents(sources, now, future);
   console.log(`Found ${sourceEvents.length} eligible source events.`);
@@ -300,68 +312,60 @@ function hasBikeAt(bike, location) {
 
 /**
  * Creates the outbound travel block. When you would have to leave before the
- * previous event ends, the trip doesn't fit: then two ❗ blocks are created, one
- * that arrives on time (leaving early) and one that leaves on time (arriving late).
+ * previous event ends, the trip doesn't fit: then the block leaves when that event
+ * ends, marked ❗ with how late you'll be and when you'd have to leave to be on time.
  * Returns how many blocks were created and the route you take (for the bike).
  */
 function handleOutboundTravel(targetCalendar, eventKey, plan) {
   const withBike = hasBikeAt(plan.bike, plan.origin);
   const routes = calculateAllRoutes(plan.origin, plan.destination, new Date(plan.arrivalTime), false, withBike, plan.bike);
-  const selectedRoute = selectBestTravelMode(routes);
-  if (!isUsableRoute(selectedRoute, '')) return { created: 0, route: null };
+  const onTimeRoute = selectBestTravelMode(routes);
+  if (!isUsableRoute(onTimeRoute, '')) return { created: 0, route: null };
 
-  const base = {
+  const block = {
     targetCalendar,
     eventKey,
     isReturn: false,
     origin: plan.origin,
     destination: plan.destination,
     originSource: plan.originSource,
-    bufferMins: plan.bufferMins
+    bufferMins: plan.bufferMins,
+    selectedRoute: onTimeRoute,
+    routes
   };
 
-  const fits = !plan.previousEnd || selectedRoute.departureTime.getTime() >= plan.previousEnd;
-  if (fits) {
-    const ok = createTravelBlock(Object.assign({ selectedRoute, routes }, base));
-    return { created: ok ? 1 : 0, route: selectedRoute };
+  const fits = !plan.previousEnd || onTimeRoute.departureTime.getTime() >= plan.previousEnd;
+  if (!fits) {
+    // Not enough time: see what happens when you leave as soon as the previous event ends.
+    const previousEnd = new Date(plan.previousEnd);
+    const leaveRoutes = calculateAllRoutes(plan.origin, plan.destination, previousEnd, true, withBike, plan.bike);
+    const leaveRoute = selectBestTravelMode(leaveRoutes);
+    const previous = `"${escapeHtml(plan.previousTitle)}" ends at ${formatTime(previousEnd)}`;
+    const onTime = `To arrive on time you'd have to leave at ${formatTime(onTimeRoute.departureTime)} ` +
+      `(<a href="${onTimeRoute.url}">${onTimeRoute.label || TRAVEL_MODES[onTimeRoute.key].label}</a>, ${onTimeRoute.durationText}).`;
+
+    if (!leaveRoute) {
+      console.log(`  -> CONFLICT: Not enough time after the previous event.`);
+      block.warning = 'leave early';
+      block.note = `Not enough time: ${previous}. ${onTime}`;
+    } else {
+      const lateMins = Math.ceil((leaveRoute.arrivalTime.getTime() - plan.eventStart) / 60000);
+      block.selectedRoute = leaveRoute;
+      block.routes = leaveRoutes;
+      if (lateMins <= 0) {
+        // Still there before the event starts, only with less buffer.
+        console.log(`  -> TIGHT: Leaving when the previous event ends still gets you there before the start.`);
+        block.note = `${previous}; leaving right after it you arrive ${formatTime(leaveRoute.arrivalTime)}, with less buffer than usual.`;
+      } else {
+        console.log(`  -> CONFLICT: Not enough time after the previous event; you'll be ${lateMins} min late.`);
+        block.warning = `${lateMins} min late`;
+        block.note = `Not enough time: ${previous}. Leaving right after it you arrive ${formatTime(leaveRoute.arrivalTime)}, ${lateMins} min after the start. ${onTime}`;
+      }
+    }
   }
 
-  // Not enough time: see what happens when you leave as soon as the previous event ends.
-  const previousEnd = new Date(plan.previousEnd);
-  const leaveRoutes = calculateAllRoutes(plan.origin, plan.destination, previousEnd, true, withBike, plan.bike);
-  const leaveRoute = selectBestTravelMode(leaveRoutes);
-  const previous = `"${escapeHtml(plan.previousTitle)}" ends at ${formatTime(previousEnd)}`;
-
-  // Still there before the event starts (only less buffer): one block is enough.
-  if (leaveRoute && leaveRoute.arrivalTime.getTime() <= plan.eventStart) {
-    console.log(`  -> TIGHT: Leaving when the previous event ends still gets you there before the start.`);
-    const ok = createTravelBlock(Object.assign({}, base, {
-      selectedRoute: leaveRoute,
-      routes: leaveRoutes,
-      note: `${previous}; leaving right after it you arrive ${formatTime(leaveRoute.arrivalTime)}, with less buffer than usual.`
-    }));
-    return { created: ok ? 1 : 0, route: leaveRoute };
-  }
-
-  console.log(`  -> CONFLICT: Not enough time after the previous event; creating an "arrive on time" and a "leave on time" block.`);
-  let created = 0;
-  if (createTravelBlock(Object.assign({}, base, {
-    selectedRoute,
-    routes,
-    warning: 'arrive on time',
-    note: `Not enough time: ${previous}. This option leaves before it ends, so you arrive on time.`
-  }))) created++;
-
-  if (leaveRoute) {
-    const lateMins = Math.ceil((leaveRoute.arrivalTime.getTime() - plan.eventStart) / 60000);
-    if (createTravelBlock(Object.assign({}, base, {
-      selectedRoute: leaveRoute,
-      routes: leaveRoutes,
-      warning: `${lateMins} min late`,
-      note: `Not enough time: ${previous}. This option leaves when it ends and arrives ${lateMins} min after the start.`
-    }))) created++;
-  }
-  return { created, route: selectedRoute };
+  const ok = createTravelBlock(block);
+  return { created: ok ? 1 : 0, route: block.selectedRoute };
 }
 
 /**
@@ -440,6 +444,10 @@ function withBikeRide(route, bike, home, endTime) {
 function isUsableRoute(route, label) {
   if (!route) {
     console.log(`  -> SKIP${label}: No valid route found.`);
+    return false;
+  }
+  if (CONFIG.MAX_TRAVEL_HOURS && route.durationSec > CONFIG.MAX_TRAVEL_HOURS * 3600) {
+    console.warn(`  -> SKIP${label}: Travel takes ${(route.durationSec / 3600).toFixed(1)} hours (more than ${CONFIG.MAX_TRAVEL_HOURS}). Is the location right?`);
     return false;
   }
   if (route.durationSec < CONFIG.MIN_TRAVEL_DURATION_SEC) {
@@ -775,7 +783,7 @@ function fetchAndMergeSourceEvents(sources, start, end) {
 
       let finalLocation = '';
       if (rawLocation) {
-        finalLocation = (cfg.locationPrefix || '') + rawLocation;
+        finalLocation = (cfg.locationPrefix || '') + rewriteLocation(rawLocation, cfg.locationReplace);
       } else if (cfg.defaultLocation) {
         finalLocation = cfg.defaultLocation;
       }
@@ -787,6 +795,18 @@ function fetchAndMergeSourceEvents(sources, start, end) {
 
   events.sort((a, b) => a.getStartTime() - b.getStartTime());
   return { events, homes };
+}
+
+/**
+ * Applies a calendar's locationReplace rules ({ find, replace }) to a location, in
+ * order. `find` is a regular expression (or a string, which is turned into one that
+ * replaces every match).
+ */
+function rewriteLocation(location, rules) {
+  return (rules || []).reduce((result, rule) => {
+    const find = rule.find instanceof RegExp ? rule.find : new RegExp(rule.find, 'g');
+    return result.replace(find, rule.replace || '').trim();
+  }, location);
 }
 
 function determineOrigin(events, currentIndex, home) {

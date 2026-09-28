@@ -338,7 +338,7 @@ function createEnv(options = {}) {
     /** Runs a scan and returns what happened during it. */
     run() {
       const before = { requests: state.requests.length, ns: state.nsRequests.length, created: state.created.length, deleted: state.deleted };
-      context.processTravelBlocks();
+      context.syncTravel();
       return {
         requests: state.requests.length - before.requests,
         nsRequests: state.nsRequests.length - before.ns,

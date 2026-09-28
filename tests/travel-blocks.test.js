@@ -345,17 +345,18 @@ test.describe('not enough time between events', () => {
     return env;
   }
 
-  test('creates one block that arrives on time and one that leaves on time', () => {
+  test('creates one ❗ block that leaves when the previous event ends, with all the info', () => {
     const env = tightDay(0);
     const titles = env.blocks().map(b => b.getTitle());
     assert.deepEqual(titles, [
       '🚶 Leave 08:45 · Walking',
-      '❗ 🚶 Leave 09:45 · Walking · arrive on time',
       '❗ 🚶 Leave 10:00 · Walking · 10 min late',
       '🚶 Leave 11:00 · Walking home'
     ]);
-    const late = env.blocks()[2];
-    assert.match(late.description, /Not enough time: "Lecture" ends at 10:00/);
+    const description = env.blocks()[1].description;
+    assert.match(description, /Not enough time: "Lecture" ends at 10:00/);
+    assert.match(description, /you arrive 10:10, 10 min after the start/);
+    assert.match(description, /To arrive on time you'd have to leave at 09:45/);
   });
 
   test('when leaving right after still gets you there before the start, one block', () => {
@@ -394,6 +395,27 @@ test.describe('calendars', () => {
     env.state.calendars.set('work', { selected: false });
     env.run();
     assert.deepEqual(env.calendarTriggers(), ['me@example.com']);
+  });
+
+  test('installs a daily trigger once and replaces triggers from older versions', () => {
+    const env = createEnv();
+    env.state.triggers.push({ getHandlerFunction: () => 'onCalendarChange', getEventType: () => 'CLOCK', getTriggerSourceId: () => null });
+    env.run();
+    env.run();
+    const triggers = env.state.triggers.map(t => `${t.getHandlerFunction()} ${t.getEventType()}`).sort();
+    assert.deepEqual(triggers, ['syncTravel CLOCK', 'syncTravel ON_EVENT_UPDATED']);
+  });
+
+  test('locations are rewritten per calendar with regular expressions, then prefixed', () => {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addCalendar('timetable', { selected: true });
+    env.exec(`CONFIG.SOURCE_CALENDARS = [{ id: 'timetable', locationReplace: [{ find: /\s*(-|Hall).*$/, replace: '' }], locationPrefix: 'TU Delft, ' }]`);
+    env.addEvent('a', at(9), at(10), 'Lecture', 'Aula - Room A', { calendar: 'timetable' });
+    env.addEvent('b', at(11), at(12), 'Lab', 'EEMCS Hall Chip', { calendar: 'timetable' });
+    env.addEvent('c', at(13), at(14), 'Lunch', 'Cafe - Delft');
+    env.run();
+    const destinations = env.blocks().filter(b => !b.getTitle().endsWith('home')).map(b => b.description.match(/➔ ([^<]*)/)[1]);
+    assert.deepEqual(destinations, ['TU Delft, Aula', 'TU Delft, EEMCS', 'Cafe - Delft']);
   });
 
   test('an event shown in two calendars gets one set of blocks', () => {
@@ -445,4 +467,17 @@ test.describe('bike tracking and change detection', () => {
 test('coordinates (e.g. where your bike is parked) are used as they are, not geocoded', () => {
   const env = createEnv();
   assert.equal(JSON.stringify(env.exec('geocodeAddress("52.0067,4.3564")')), '{"lat":52.0067,"lng":4.3564}');
+});
+
+test.describe('very long trips', () => {
+  test('no travel block when the trip takes more than MAX_TRAVEL_HOURS, with a warning', () => {
+    const env = createEnv({
+      durations: { WALKING: 900, BICYCLING: 600, DRIVING: 300 },
+      timetable: [{ every: 15, offset: 0, duration: 290 }]
+    });
+    env.addEvent('far', at(12), at(13), 'Conference', 'Far Away, Germany');
+    env.run();
+    assert.equal(env.blocks().length, 0);
+    assert.ok(env.state.logs.some(line => line.startsWith('WARN') && line.includes('more than 4')));
+  });
 });

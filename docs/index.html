@@ -196,7 +196,7 @@
       <div class="card">
         <div class="icon">❗</div>
         <h3>Warns when it doesn't fit</h3>
-        <p>Not enough time between two events? You get two blocks marked ❗: one that leaves early to arrive on time, and one that leaves on time and tells you how late you'll be.</p>
+        <p>Not enough time between two events? You get one block marked ❗ that leaves when the first one ends, with how late you'll be and when you'd have to leave to be on time.</p>
       </div>
       <div class="card">
         <div class="icon">✍️</div>
@@ -259,17 +259,17 @@
         </li>
         <li>
           <h3>Add your details</h3>
-          <p>Under Project Settings → Script Properties, add <code>TARGET_CALENDAR_ID</code>, <code>HOME_LOCATION</code> and optionally <code>NS_API_KEY</code> (free at <a href="https://apiportal.ns.nl/">apiportal.ns.nl</a>).</p>
+          <p>Add a file <code>Config.local</code> with your <code>TARGET_CALENDAR_ID</code>, <code>HOME_LOCATION</code> and optionally <code>NS_API_KEY</code> (free at <a href="https://apiportal.ns.nl/">apiportal.ns.nl</a>), or set them as Script Properties.</p>
         </li>
         <li>
           <h3>Run it</h3>
-          <p>Run <code>processTravelBlocks</code> once to grant permissions, then <code>installTriggers</code> to keep it running automatically.</p>
+          <p>Run <code>syncTravel</code> once and grant permissions. It sets up its own triggers and runs automatically from then on.</p>
         </li>
       </ol>
     </div>
     <div>
       <h2>Make it yours</h2>
-      <p class="section-intro">All options are documented in <code>Config.gs</code>. Override the ones you want in your own <code>Config.local</code> file.</p>
+      <p class="section-intro">All options are documented in the <code>CONFIG</code> block of the script. Override the ones you want in your own <code>Config.local</code> file.</p>
 <pre><code><span class="c">// When to walk or bike</span>
 MODE_SELECTION: {
   walkIfUnderMinutes: <span class="n">15</span>,

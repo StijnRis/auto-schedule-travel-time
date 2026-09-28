@@ -10,8 +10,9 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-// Same order as the tests load them. Config.local.gs is left out on purpose: it is personal.
-const SOURCE_FILES = ['Config.gs', 'Code.gs', 'Routes.gs', 'NsApi.gs'];
+// Code.gs first, so syncTravel is the first function (the one Apps Script runs by default).
+// Config.local.gs is left out on purpose: it is personal.
+const SOURCE_FILES = ['Code.gs', 'Config.gs', 'Routes.gs', 'NsApi.gs'];
 const OUT_FILE = path.join(ROOT, 'dist', 'TravelBlocks.gs');
 
 const header = [
