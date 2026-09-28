@@ -184,39 +184,265 @@ test.describe('public transport connections', () => {
     assert.equal(home.getTitle(), '🚌 Leave 20:05 · Transit home');
     assert.ok(!home.description.includes('Arrive earlier'));
   });
+});
 
-  test('NS: fastest on-time trip, alternatives and trip links', () => {
-    const nsTrips = [
-      { dep: at(17, 50), arr: at(18, 30), transfers: 1 },  // earlier, slow
-      { dep: at(18, 10), arr: at(18, 35) },                // earlier, fast
-      { dep: at(18, 20), arr: at(18, 50), transfers: 1 },  // on time, 30 min
-      { dep: at(18, 30), arr: at(18, 52) },                // on time, 22 min  <- fastest
-      { dep: at(18, 40), arr: at(19, 10) }                 // later
-    ];
-    const env = createEnv({ nsTrips, config: { NS: { preferOverGoogleTransit: true, language: 'en' } } });
-    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Delft');
+/** Addresses as "lat,lng" are stations or stops; getting there takes `near` minutes. */
+const isPlace = text => /^\d/.test(text);
+const nearStops = (near, far) => (origin, destination) => (isPlace(origin) || isPlace(destination) ? near : far);
+
+test.describe('NS trains', () => {
+  // Trains between the stations nearest to home and to the event.
+  const nsTrips = [
+    { dep: at(17, 50), arr: at(18, 30), transfers: 1 },  // earlier, slow
+    { dep: at(18, 5), arr: at(18, 35) },                 // earlier, fast
+    { dep: at(18, 15), arr: at(18, 45), transfers: 1 },  // on time, 30 min
+    { dep: at(18, 25), arr: at(18, 47) },                // on time, 22 min  <- fastest
+    { dep: at(18, 40), arr: at(19, 10) }                 // later
+  ];
+  const durations = { WALKING: nearStops(5, 90), BICYCLING: nearStops(8, 55) };
+
+  test('from home you bike to the station and park, then take the fastest train', () => {
+    const env = createEnv({ nsTrips, durations });
+    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Den Haag');
     env.run();
 
     const outbound = env.blocks()[0];
-    assert.equal(outbound.getTitle(), '🚆 Leave 18:30 · NS');
+    // 8 min biking + 5 min parking before the 18:25 train, 5 min walk after it.
+    assert.equal(outbound.getTitle(), '🚲🚆 Leave 18:12 · Bike + NS');
     assert.equal(env.time(outbound.getEndTime()), '18:52');
     const description = outbound.description;
     assert.match(description, /href="https:\/\/www.ns.nl\/rpx\?ctx=trip-3"><b>Open NS Journey Planner/);
-    assert.match(description, /🚆 NS<\/a>: <b>18:30 - 18:52 \(0:22\)<\/b> · 0 transfer\(s\) ✅/);
-    assert.match(description, /<a href="https:\/\/www.ns.nl\/rpx\?ctx=trip-1">Arrive earlier<\/a>: 18:10 - 18:35 \(0:25\)/);
-    assert.match(description, /<a href="https:\/\/www.ns.nl\/rpx\?ctx=trip-4">Arrive later<\/a>: 18:40 - 19:10 \(0:30\)/);
+    assert.match(description, /🚲🚆 Bike \+ NS<\/a>: <b>18:12 - 18:52 \(0:40\)<\/b> · 0 transfer\(s\) ✅/);
+    assert.match(description, /<a href="https:\/\/www.ns.nl\/rpx\?ctx=trip-2">Arrive earlier<\/a>: 18:02 - 18:50 \(0:48\)/);
+    assert.match(description, /🚲 Bike to the station \(8 mins\) and park your bike \(5 mins\)/);
+    assert.match(description, /🚶 Walk 5 mins/);
   });
 
-  test('NS: request uses coordinates, arrival search and Amsterdam time', () => {
-    const env = createEnv({ nsTrips: [] });
-    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Delft');
+  test('trips are planned between stations, arriving in time for the last bit', () => {
+    const env = createEnv({ nsTrips: [], durations });
+    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Den Haag');
     env.run();
 
     const url = decodeURIComponent(env.state.nsRequests[0]);
-    assert.match(url, /originLat=52&originLng=4.36/);
+    assert.match(url, /\/v3\/trips\?fromStation=ST\d+&toStation=ST\d+/);
     assert.match(url, /searchForArrival=true/);
-    assert.match(url, /previousAdvices=3&nextAdvices=3/);
-    // 18:55 UTC in Amsterdam time, with a colon in the offset
-    assert.match(url, /dateTime=\d{4}-\d{2}-\d{2}T(19|20):55:00\+0[12]:00/);
+    // 18:55 minus the 5 minute walk from the station, in Amsterdam time.
+    assert.match(url, /dateTime=\d{4}-\d{2}-\d{2}T(19|20):50:00\+0[12]:00/);
+    assert.ok(!url.includes('originLat'), 'no door-to-door request');
   });
+
+  test('your bike stays at the station; later you walk there, and ride home at the end of the day', () => {
+    const morningTrain = { dep: at(8, 20), arr: at(8, 42) };
+    const env = createEnv({ nsTrips: [morningTrain, ...nsTrips], durations });
+    env.addEvent('work', at(9), at(17), 'Work', 'Office, Den Haag');
+    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Den Haag');
+    env.run();
+
+    const titles = env.blocks().map(b => b.getTitle());
+    assert.equal(titles[0], '🚲🚆 Leave 08:07 · Bike + NS');
+    // Work -> lecture: your bike is at the station near home, so no bike this time.
+    assert.equal(titles[1], '🚆 Leave 18:20 · NS');
+    assert.match(env.blocks()[1].description, /Biking: <i>your bike is at Station \d+ station<\/i>/);
+    // Going home you travel back to your bike and ride it home.
+    assert.match(titles[2], /\+ bike home$/);
+    assert.match(env.blocks()[2].description, /Pick up your bike at <i>Station \d+ station<\/i> \(2 min\) and bike home: 8 mins/);
+  });
+});
+
+test.describe('Google transit with your bike', () => {
+  // A bus every 15 minutes; the stop is a 10 minute walk but a 3 minute bike ride.
+  const timetable = [{ every: 15, offset: 0, duration: 30, walk: 10, stop: 'Bus Station' }];
+  const durations = { BICYCLING: nearStops(3, 55) };
+
+  test('bikes to the stop instead of walking, and parks there', () => {
+    const env = createEnv({ timetable, durations });
+    env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft');
+    env.run();
+
+    const outbound = env.blocks()[0];
+    // The bus leaves the stop at 08:25: bike 3 min + park 5 min.
+    assert.equal(outbound.getTitle(), '🚲🚌 Leave 08:17 · Bike + Transit');
+    assert.match(outbound.description, /1\. 🚲 Bike to <i>Bus Station<\/i> \(3 mins\) and park your bike \(5 mins\)<br>2\. <b>\[08:25\] Board Bus 1/);
+    assert.ok(!outbound.description.includes('Walk to Bus Stop'));
+  });
+
+  test('going home you take the bus back to your bike and ride home', () => {
+    const env = createEnv({ timetable, durations });
+    env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft');
+    env.run();
+
+    const home = env.blocks()[1];
+    assert.equal(home.getTitle(), '🚌🚲 Leave 10:00 · Transit + bike home');
+    // Bus 10:00-10:30, pick up the bike (2 min), ride 3 min.
+    assert.equal(env.time(home.getEndTime()), '10:35');
+    assert.match(home.description, /Travel Options to your bike at Bus Station/);
+  });
+
+  test('walking to the stop stays when the bike is no faster', () => {
+    const env = createEnv({ timetable: [{ every: 15, duration: 30, walk: 2 }], durations });
+    env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft');
+    env.run();
+    assert.equal(env.blocks()[0].getTitle(), '🚌 Leave 08:15 · Transit');
+  });
+});
+
+test.describe('all-day events: where you sleep', () => {
+  function stay(firstDay, days) {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addEvent('hotel', day + firstDay * 24 * HOUR, day + (firstDay + days) * 24 * HOUR, 'Hotel', 'Hotel Street 5, Rotterdam', { allDay: true });
+    [0, 1, 2, 3].forEach(d => env.addEvent(`lecture${d}`, at(24 * d + 9), at(24 * d + 10), 'Lecture', 'Lecture Hall, Delft'));
+    env.run();
+    // [from, to] for each day's trip there and trip back
+    return env.blocks().map(b => (b.getTitle().endsWith('home') ? b.description.match(/➔ ([^<]*)/)[1] : b.getLocation()));
+  }
+
+  test('a stay from Friday to Sunday: leave from home Friday, go home Sunday', () => {
+    assert.deepEqual(stay(0, 3), [
+      'Home Street 1, Delft', 'Hotel Street 5, Rotterdam',        // day 1: from home, sleep at the hotel
+      'Hotel Street 5, Rotterdam', 'Hotel Street 5, Rotterdam',   // day 2
+      'Hotel Street 5, Rotterdam', 'Home Street 1, Delft',        // day 3: from the hotel, back home
+      'Home Street 1, Delft', 'Home Street 1, Delft'              // day 4
+    ]);
+  });
+
+  test('a single-day event is not a stay: you sleep at home', () => {
+    assert.deepEqual(stay(1, 1), [
+      'Home Street 1, Delft', 'Home Street 1, Delft',
+      'Home Street 1, Delft', 'Home Street 1, Delft',
+      'Home Street 1, Delft', 'Home Street 1, Delft',
+      'Home Street 1, Delft', 'Home Street 1, Delft'
+    ]);
+  });
+});
+
+test.describe('travel you planned yourself', () => {
+  test('an event you added to the travel calendar replaces the travel block', () => {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft');
+    env.run();
+    assert.equal(env.blocks().length, 2);
+
+    env.addManualTravel(at(8, 20), at(8, 50), 'Lift from Anna');
+    env.run();
+    const titles = env.blocks().map(b => b.getTitle());
+    assert.deepEqual(titles, ['Lift from Anna', '🚶 Leave 10:00 · Walking home']);
+  });
+
+  test('travel-like events in your other calendars are normal events', () => {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addEvent('train', at(8), at(8, 50), 'Train to Delft', 'Den Haag Centraal');
+    env.run();
+    assert.equal(env.blocks().length, 2);
+  });
+});
+
+test.describe('not enough time between events', () => {
+  function tightDay(nextStartMinutes) {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft');
+    env.addEvent('meeting', at(10, nextStartMinutes), at(11), 'Meeting', 'Office, Delft');
+    env.run();
+    return env;
+  }
+
+  test('creates one block that arrives on time and one that leaves on time', () => {
+    const env = tightDay(0);
+    const titles = env.blocks().map(b => b.getTitle());
+    assert.deepEqual(titles, [
+      '🚶 Leave 08:45 · Walking',
+      '❗ 🚶 Leave 09:45 · Walking · arrive on time',
+      '❗ 🚶 Leave 10:00 · Walking · 10 min late',
+      '🚶 Leave 11:00 · Walking home'
+    ]);
+    const late = env.blocks()[2];
+    assert.match(late.description, /Not enough time: "Lecture" ends at 10:00/);
+  });
+
+  test('when leaving right after still gets you there before the start, one block', () => {
+    const env = tightDay(12);
+    const titles = env.blocks().map(b => b.getTitle());
+    assert.equal(titles[1], '🚶 Leave 10:00 · Walking');
+    assert.equal(titles.length, 3);
+  });
+
+  test('a second run leaves the conflict blocks alone', () => {
+    const env = tightDay(0);
+    assert.deepEqual(env.run(), { requests: 0, nsRequests: 0, created: 0, deleted: 0 });
+  });
+});
+
+test.describe('calendars', () => {
+  test('reads every enabled calendar, skips disabled ones and the travel calendar', () => {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addCalendar('work', { selected: true });
+    env.addCalendar('old', { selected: false });
+    env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft', { calendar: 'work' });
+    env.addEvent('hidden', at(15), at(16), 'Old', 'Somewhere, Delft', { calendar: 'old' });
+    env.run();
+
+    assert.equal(env.blocks().length, 2);
+    assert.deepEqual(env.calendarTriggers(), ['me@example.com', 'work']);
+  });
+
+  test('enabling a calendar later adds its trigger; disabling removes it', () => {
+    const env = createEnv();
+    env.run();
+    env.addCalendar('work', { selected: true });
+    env.run();
+    assert.deepEqual(env.calendarTriggers(), ['me@example.com', 'work']);
+
+    env.state.calendars.set('work', { selected: false });
+    env.run();
+    assert.deepEqual(env.calendarTriggers(), ['me@example.com']);
+  });
+
+  test('an event shown in two calendars gets one set of blocks', () => {
+    const env = createEnv({ durations: { WALKING: 10 } });
+    env.addCalendar('family', { selected: true });
+    env.addEvent('dinner', at(18), at(20), 'Dinner', 'Restaurant, Delft');
+    env.addEvent('dinner', at(18), at(20), 'Dinner', 'Restaurant, Delft', { calendar: 'family' });
+    env.run();
+    assert.equal(env.blocks().length, 2);
+  });
+});
+
+test('the description has no 9292 link', () => {
+  const env = createEnv();
+  env.addEvent('lecture', at(9), at(10), 'Lecture', 'Lecture Hall, Delft');
+  env.run();
+  assert.ok(!env.blocks()[0].description.includes('9292'));
+});
+
+test.describe('bike tracking and change detection', () => {
+  const walking = (origin, destination) => ([origin, destination].some(p => p.includes('Neighbour')) ? 10 : nearStops(5, 90)(origin, destination));
+  const durations = { WALKING: walking, BICYCLING: nearStops(8, 55) };
+  const nsTrips = [{ dep: at(8, 20), arr: at(8, 42) }, { dep: at(18, 25), arr: at(18, 47) }];
+
+  test('a second run changes nothing', () => {
+    const env = createEnv({ nsTrips, durations });
+    env.addEvent('work', at(9), at(17), 'Work', 'Office, Den Haag');
+    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Den Haag');
+    env.run();
+    assert.deepEqual(env.run(), { requests: 0, nsRequests: 0, created: 0, deleted: 0 });
+  });
+
+  test('when the first trip no longer uses the bike, the later trips are recalculated', () => {
+    const env = createEnv({ nsTrips, durations });
+    env.addEvent('work', at(9), at(17), 'Work', 'Office, Den Haag');
+    env.addEvent('lecture', at(19), at(20), 'Lecture', 'Lecture Hall, Den Haag');
+    env.run();
+    assert.match(env.blocks()[2].getTitle(), /\+ bike home$/);
+
+    // Work moves next door: you walk there and your bike stays at home.
+    env.removeEvent('work');
+    env.addEvent('work', at(9), at(17), 'Work', 'Neighbour, Delft');
+    const result = env.run();
+    assert.equal(result.created, 3); // work, lecture and the trip home: all changed
+    assert.ok(!env.blocks().some(b => b.getTitle().includes('+ bike')));
+  });
+});
+
+test('coordinates (e.g. where your bike is parked) are used as they are, not geocoded', () => {
+  const env = createEnv();
+  assert.equal(JSON.stringify(env.exec('geocodeAddress("52.0067,4.3564")')), '{"lat":52.0067,"lng":4.3564}');
 });

@@ -176,7 +176,7 @@
       <div class="card">
         <div class="icon">🚆</div>
         <h3>NS journey planner</h3>
-        <p>In the Netherlands, it plans door-to-door journeys with the official NS API: trains, tracks, transfers, fares and crowd forecasts.</p>
+        <p>In the Netherlands, it plans trains with the official NS API: tracks, transfers, fares and crowd forecasts, with the way to and from the station planned too.</p>
       </div>
       <div class="card">
         <div class="icon">🔗</div>
@@ -186,7 +186,22 @@
       <div class="card">
         <div class="icon">📍</div>
         <h3>Knows where you are</h3>
-        <p>Back-to-back events? It routes from your previous event. Long gap? It assumes you went home. After the last event it plans your trip home.</p>
+        <p>Back-to-back events? It routes from your previous event. Long gap? It assumes you went home. After the last event it plans your trip home. Sleeping somewhere else? Add a multi-day all-day event with that address.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🚲</div>
+        <h3>Knows where your bike is</h3>
+        <p>From home you bike to the bus stop or station instead of walking. Your bike stays where you parked it, and at the end of the day you're sent back to it to ride home.</p>
+      </div>
+      <div class="card">
+        <div class="icon">❗</div>
+        <h3>Warns when it doesn't fit</h3>
+        <p>Not enough time between two events? You get two blocks marked ❗: one that leaves early to arrive on time, and one that leaves on time and tells you how late you'll be.</p>
+      </div>
+      <div class="card">
+        <div class="icon">✍️</div>
+        <h3>Respects your own plans</h3>
+        <p>Planned the trip yourself, like a lift or a train you booked? Add it to your travel calendar and no second travel block is added.</p>
       </div>
       <div class="card">
         <div class="icon">✈️</div>
@@ -203,7 +218,7 @@
       <h2>Everything in the event</h2>
       <p class="section-intro">Open a travel block to see all options side by side. Each one is a link to that specific travel mode, and the chosen route comes with step-by-step directions.</p>
       <div class="flow">
-        <div>1. Collect events from your calendars for the next 14 days</div>
+        <div>1. Collect events from every enabled calendar for the next 14 days</div>
         <div>2. Work out where you're coming from (home or the previous event)</div>
         <div>3. Skip events whose trip hasn't changed since the last run</div>
         <div>4. Ask Google Maps and NS for every travel mode, arriving on time</div>
@@ -240,7 +255,7 @@
         </li>
         <li>
           <h3>Copy the script</h3>
-          <p>Create a project on <a href="https://script.google.com/">script.google.com</a> and add the files from the <a href="https://github.com/StijnRis/auto-schedule-travel-time/tree/main/src"><code>src</code> folder</a>.</p>
+          <p>Create a project on <a href="https://script.google.com/">script.google.com</a> and paste in <a href="https://github.com/StijnRis/auto-schedule-travel-time/releases/download/latest/TravelBlocks.gs"><code>TravelBlocks.gs</code></a>: all the code in one file.</p>
         </li>
         <li>
           <h3>Add your details</h3>
@@ -254,7 +269,7 @@
     </div>
     <div>
       <h2>Make it yours</h2>
-      <p class="section-intro">Everything is configured in <code>Config.gs</code>.</p>
+      <p class="section-intro">All options are documented in <code>Config.gs</code>. Override the ones you want in your own <code>Config.local</code> file.</p>
 <pre><code><span class="c">// When to walk or bike</span>
 MODE_SELECTION: {
   walkIfUnderMinutes: <span class="n">15</span>,

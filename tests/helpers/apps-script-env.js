@@ -48,20 +48,28 @@ function formatDate(date, timeZone, pattern) {
  * Creates a fake environment.
  * @param {Object} options
  *   events:     source calendar events (see makeEvent)
- *   durations:  minutes per mode for WALKING / BICYCLING / DRIVING
- *   timetable:  transit lines [{ every, offset, duration }] in minutes
- *   nsTrips:    NS trips [{ dep, arr, transfers }] as timestamps (ms); omit to disable NS
+ *   durations:  minutes per mode for WALKING / BICYCLING / DRIVING, or a function
+ *               (origin, destination) => minutes
+ *   timetable:  transit lines [{ every, offset, duration, walk }] in minutes; walk =
+ *               minutes from the start of the trip to the stop where you board
+ *   nsTrips:    NS trips [{ dep, arr, transfers }] as timestamps (ms); omit to disable NS.
+ *               Every address has its own nearest station ("ST<n>", 500 m away) and
+ *               a second one 3 km away.
  *   config:     overrides for CONFIG
  */
 function createEnv(options = {}) {
   const state = {
     requests: [],        // every Directions request: { mode, arrive, depart }
-    nsRequests: [],      // every NS API URL
+    nsRequests: [],      // every NS trips API URL
+    nsStationRequests: 0,
     created: [],         // travel blocks created
     deleted: 0,
     failNextRequests: 0, // make the next N Directions requests throw
     events: options.events || [],
     target: [],
+    // Source calendars besides the primary one: id -> { selected, hidden }
+    calendars: new Map(),
+    triggers: [],
     props: new Map(),
     logs: []
   };
@@ -91,14 +99,34 @@ function createEnv(options = {}) {
 
   const overlaps = (e, from, to) => e.getStartTime() < to && e.getEndTime() > from;
 
+  const PRIMARY_ID = 'me@example.com';
+  function sourceCalendar(id) {
+    const settings = id === PRIMARY_ID ? { selected: true } : state.calendars.get(id);
+    return {
+      getId: () => id,
+      getName: () => id,
+      isSelected: () => Boolean(settings.selected),
+      isHidden: () => Boolean(settings.hidden),
+      getEvents: (from, to) => state.events.filter(e => (e.calendarId || PRIMARY_ID) === id && overlaps(e, from, to))
+    };
+  }
+
   const CalendarApp = {
     GuestStatus: { NO: 'NO', YES: 'YES' },
+    getDefaultCalendar: () => sourceCalendar(PRIMARY_ID),
+    getAllCalendars: () => [PRIMARY_ID, ...state.calendars.keys()]
+      .map(id => CalendarApp.getCalendarById(id))
+      .concat([CalendarApp.getCalendarById('travel-calendar')]),
     getCalendarById: id => {
-      if (id === 'primary') {
-        return { getEvents: (from, to) => state.events.filter(e => overlaps(e, from, to)) };
+      if (id === 'primary' || id === PRIMARY_ID || state.calendars.has(id)) {
+        return sourceCalendar(id === 'primary' ? PRIMARY_ID : id);
       }
       if (id !== 'travel-calendar') return null;
       return {
+        getId: () => 'travel-calendar',
+        getName: () => 'Travel',
+        isSelected: () => true,
+        isHidden: () => false,
         getEvents: (from, to) => state.target.filter(e => overlaps(e, from, to)),
         createEvent: (title, start, end, opts) => {
           const event = makeCalendarEvent(`travel-${state.created.length}`, start.getTime(), end.getTime(), title, opts.location);
@@ -119,12 +147,27 @@ function createEnv(options = {}) {
       const departure = finder.depart !== undefined
         ? Math.ceil((finder.depart - offset) / every) * every + offset
         : Math.floor((finder.arrive - duration - offset) / every) * every + offset;
+      const board = departure + (line.walk || 0) * MINUTE;
+      const steps = [];
+      if (line.walk) {
+        steps.push({ travel_mode: 'WALKING', html_instructions: 'Walk to Bus Stop', duration: { text: `${line.walk} mins` } });
+      }
+      steps.push({
+        travel_mode: 'TRANSIT',
+        duration: { text: `${line.duration - (line.walk || 0)} mins` },
+        transit_details: {
+          line: { short_name: line.name || 'Bus 1' },
+          departure_stop: { name: line.stop || 'Main Stop', location: { lat: 52.1, lng: 4.3 } },
+          arrival_stop: { name: 'End Stop' },
+          departure_time: { value: board / 1000, text: formatDate(new Date(board), 'UTC', 'HH:mm') }
+        }
+      });
       return {
         legs: [{
           duration: { value: duration / 1000, text: `${line.duration} mins` },
           departure_time: { value: departure / 1000, text: formatDate(new Date(departure), 'UTC', 'HH:mm') },
           arrival_time: { value: (departure + duration) / 1000, text: formatDate(new Date(departure + duration), 'UTC', 'HH:mm') },
-          steps: []
+          steps
         }]
       };
     });
@@ -147,18 +190,37 @@ function createEnv(options = {}) {
             throw new Error('Service invoked too many times for one day: route.');
           }
           if (finder.mode === 'TRANSIT') return { routes: transitRoutes(finder) };
-          const minutes = durations[finder.mode];
+          const d = durations[finder.mode];
+          const minutes = typeof d === 'function' ? d(finder.origin, finder.destination) : d;
           return { routes: [{ legs: [{ duration: { value: minutes * 60, text: `${minutes} mins` }, steps: [] }] }] };
         }
       };
       return finder;
     },
-    newGeocoder: () => ({ geocode: () => ({ results: [{ geometry: { location: { lat: 52.0, lng: 4.36 } } }] }) })
+    // Every address gets its own coordinates.
+    newGeocoder: () => ({
+      geocode: address => {
+        const n = [...address].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 997, 7);
+        return { results: [{ geometry: { location: { lat: 52 + n / 10000, lng: 4.36 } } }] };
+      }
+    })
   };
 
   const nsTime = ms => formatDate(new Date(ms), 'Europe/Amsterdam', "yyyy-MM-dd'T'HH:mm:ssZ");
   const UrlFetchApp = {
     fetch: url => {
+      if (url.includes('/stations/nearest')) {
+        state.nsStationRequests++;
+        const params = new URL(url).searchParams;
+        const lat = Number(params.get('lat'));
+        const lng = Number(params.get('lng'));
+        const n = Math.round((lat - 52) * 10000);
+        const payload = [
+          { code: `ST${n}`, namen: { lang: `Station ${n}` }, lat: lat + 0.001, lng, distance: 500 },
+          { code: `FAR${n}`, namen: { lang: `Far Station ${n}` }, lat: lat + 0.03, lng, distance: 3000 }
+        ].slice(0, Number(params.get('limit')) || 2);
+        return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ payload }) };
+      }
       state.nsRequests.push(url);
       const trips = (options.nsTrips || []).map((t, i) => ({
         idx: i,
@@ -199,7 +261,32 @@ function createEnv(options = {}) {
       })
     },
     CacheService: { getScriptCache: () => ({ get: k => cache.get(k) || null, put: (k, v) => cache.set(k, v) }) },
-    ScriptApp: { getProjectTriggers: () => [] },
+    ScriptApp: {
+      EventType: { ON_EVENT_UPDATED: 'ON_EVENT_UPDATED', CLOCK: 'CLOCK' },
+      getProjectTriggers: () => state.triggers.slice(),
+      deleteTrigger: t => { state.triggers = state.triggers.filter(x => x !== t); },
+      newTrigger: handler => {
+        const trigger = { handler, type: 'CLOCK', source: null };
+        const builder = {
+          forUserCalendar: id => { trigger.type = 'ON_EVENT_UPDATED'; trigger.source = id; return builder; },
+          onEventUpdated: () => builder,
+          timeBased: () => builder,
+          everyDays: () => builder,
+          atHour: () => builder,
+          after: () => builder,
+          create: () => {
+            const created = {
+              getHandlerFunction: () => trigger.handler,
+              getEventType: () => trigger.type,
+              getTriggerSourceId: () => trigger.source
+            };
+            state.triggers.push(created);
+            return created;
+          }
+        };
+        return builder;
+      }
+    },
     Utilities: {
       DigestAlgorithm: { SHA_256: 'sha256', MD5: 'md5' },
       Charset: { UTF_8: 'utf8' },
@@ -227,11 +314,24 @@ function createEnv(options = {}) {
     state,
     context,
     /** Adds a source event; times are timestamps (ms). */
-    addEvent(id, start, end, title, location, extra) {
+    addEvent(id, start, end, title, location, extra = {}) {
       const event = makeCalendarEvent(id, start, end, title, location, extra);
+      event.calendarId = extra.calendar;
       state.events.push(event);
       return event;
     },
+    /** Adds a calendar besides the primary one, enabled (selected) or not. */
+    addCalendar(id, settings = { selected: true }) {
+      state.calendars.set(id, settings);
+    },
+    /** Adds an event to the travel calendar by hand (without the script's tag). */
+    addManualTravel(start, end, title) {
+      const event = makeCalendarEvent(`manual-${state.target.length}`, start, end, title, '');
+      state.target.push(event);
+      return event;
+    },
+    /** Calendar IDs that have a change trigger. */
+    calendarTriggers: () => state.triggers.filter(t => t.getEventType() === 'ON_EVENT_UPDATED').map(t => t.getTriggerSourceId()).sort(),
     removeEvent(id) {
       state.events = state.events.filter(e => e.getId() !== id);
     },

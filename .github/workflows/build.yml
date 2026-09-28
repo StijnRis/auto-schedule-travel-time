@@ -1,0 +1,45 @@
+name: Build single-file script
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/build.js'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Run tests
+        run: npm test
+      - name: Combine the Apps Script files
+        run: npm run build
+      - name: Check syntax of the combined file
+        run: node --check --input-type=commonjs < dist/TravelBlocks.gs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TravelBlocks
+          path: dist/TravelBlocks.gs
+      - name: Publish to the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest dist/TravelBlocks.gs \
+            --target "$GITHUB_SHA" \
+            --title "Latest build" \
+            --notes "TravelBlocks.gs built from ${GITHUB_SHA::7}. Paste it into your Apps Script project, see the README."

@@ -20,14 +20,22 @@ const ALTERNATIVE_WINDOW_MIN = 60;    // Earlier/later connections must arrive w
 /**
  * Calculates a route for every travel mode.
  * @param {Date} targetTime Arrival time, or departure time when isDepartureTime is true.
+ * @param {boolean} withBike Whether your bike is at the origin. Without it there is
+ *     no biking option; with it public transport starts with a bike ride to the stop.
+ * @param {Object|null} bike Where your bike is (null = at home), for the description.
  * @return {Object} Map of mode key -> normalized route (or null when unavailable).
  */
-function calculateAllRoutes(origin, destination, targetTime, isDepartureTime) {
+function calculateAllRoutes(origin, destination, targetTime, isDepartureTime, withBike, bike) {
   const results = {};
+  if (!withBike) results.bikeAway = bike ? bike.name : 'home';
 
   GOOGLE_MODE_KEYS.forEach(key => {
+    if (key === 'BICYCLING' && !withBike) {
+      results[key] = null;
+      return;
+    }
     try {
-      results[key] = getGoogleRoute(key, origin, destination, targetTime, isDepartureTime);
+      results[key] = getGoogleRoute(key, origin, destination, targetTime, isDepartureTime, withBike);
     } catch (e) {
       console.warn(`  -> ${key} route failed: ${e}`);
       results[key] = null;
@@ -36,7 +44,7 @@ function calculateAllRoutes(origin, destination, targetTime, isDepartureTime) {
   });
 
   try {
-    results.NS = getNsRoute(origin, destination, targetTime, isDepartureTime);
+    results.NS = getNsRoute(origin, destination, targetTime, isDepartureTime, withBike);
   } catch (e) {
     console.warn(`  -> NS route failed: ${e}`);
     results.NS = null;
@@ -71,9 +79,9 @@ function requestDirections(key, origin, destination, time, isDepartureTime) {
   return requestRoutes(key, origin, destination, time, isDepartureTime, false)[0] || null;
 }
 
-function getGoogleRoute(key, origin, destination, targetTime, isDepartureTime) {
+function getGoogleRoute(key, origin, destination, targetTime, isDepartureTime, withBike) {
   if (key === 'TRANSIT') {
-    return getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime);
+    return getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime, withBike);
   }
 
   const route = requestDirections(key, origin, destination, targetTime, isDepartureTime);
@@ -113,7 +121,7 @@ function getGoogleRoute(key, origin, destination, targetTime, isDepartureTime) {
  * Google transit: collects connections around the target time and picks the fastest,
  * plus the fastest connection arriving earlier and later.
  */
-function getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime) {
+function getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime, withBike) {
   const connections = [];
   const search = (time, departAt) => {
     requestRoutes('TRANSIT', origin, destination, time, departAt, true).forEach(route => {
@@ -147,7 +155,7 @@ function getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime)
 
   const leg = chosen.route.legs[0];
   const transitUrl = c => buildGoogleMapsUrl(origin, destination, TRAVEL_MODES.TRANSIT.urlCode, c.arrivalTime, false);
-  return {
+  const route = {
     key: 'TRANSIT',
     durationSec: (chosen.arrivalTime - chosen.departureTime) / 1000,
     durationText: leg.duration.text,
@@ -158,6 +166,69 @@ function getGoogleTransitRoute(origin, destination, targetTime, isDepartureTime)
     stepsHtml: formatGoogleStepsHtml(chosen.route),
     alternatives: pickAlternatives(connections, chosen, transitUrl)
   };
+
+  // With your bike: bike to a stop instead of walking (and maybe skip the first bus).
+  if (withBike && !isDepartureTime) {
+    const byBike = bikeToBoardingStop(chosen, origin);
+    if (byBike) {
+      const stop = byBike.step.transit_details.departure_stop;
+      const bikeMins = Math.round(byBike.bikeSec / 60);
+      Object.assign(route, {
+        label: `Bike + ${TRAVEL_MODES.TRANSIT.label}`,
+        emoji: `🚲${TRAVEL_MODES.TRANSIT.emoji}`,
+        durationSec: (chosen.arrivalTime - byBike.departureTime) / 1000,
+        durationText: `${Math.round((chosen.arrivalTime - byBike.departureTime) / 60000)} mins`,
+        departureTime: byBike.departureTime,
+        bikeParkedAt: { name: stop.name, location: `${stop.location.lat},${stop.location.lng}` },
+        stepsHtml: formatGoogleStepsHtml(chosen.route, byBike.stepIndex,
+          `🚲 Bike to <i>${escapeHtml(stop.name)}</i> (${bikeMins} mins) and park your bike (${CONFIG.BIKE.parkMinutes} mins)`)
+      });
+    }
+  }
+  return route;
+}
+
+/**
+ * Biking to one of the stops where the connection boards a vehicle, parking your
+ * bike and continuing from there. Returns the option that lets you leave latest,
+ * only when that is later than walking to the first stop.
+ */
+function bikeToBoardingStop(connection, origin) {
+  const parkMs = CONFIG.BIKE.parkMinutes * 60 * 1000;
+  let best = null;
+  connection.route.legs[0].steps.forEach((step, stepIndex) => {
+    const details = step.travel_mode === 'TRANSIT' && step.transit_details;
+    if (!details || !details.departure_stop || !details.departure_stop.location || !details.departure_time) return;
+    const stop = details.departure_stop.location;
+    const bikeSec = getCachedDuration('BICYCLING', origin, `${stop.lat},${stop.lng}`);
+    if (bikeSec === null) return;
+    const departureTime = new Date(details.departure_time.value * 1000 - parkMs - bikeSec * 1000);
+    if (!best || departureTime > best.departureTime) best = { step, stepIndex, bikeSec, departureTime };
+  });
+  return best && best.departureTime > connection.departureTime ? best : null;
+}
+
+/**
+ * Travel time in seconds between two places for walking or biking (no timetable,
+ * so the result is cached for 6 hours). null when there is no route.
+ */
+function getCachedDuration(key, origin, destination) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = `dur_${shortHash([key, origin, destination].join('|'), 32)}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached === 'none' ? null : Number(cached);
+
+  let seconds;
+  try {
+    const route = requestDirections(key, origin, destination, new Date(), true);
+    seconds = route ? route.legs[0].duration.value : null;
+  } catch (e) {
+    console.warn(`  -> ${key} route failed: ${e}`);
+    failedRequests++;
+    return null;
+  }
+  cache.put(cacheKey, seconds === null ? 'none' : String(seconds), 6 * 60 * 60);
+  return seconds;
 }
 
 /**
@@ -265,17 +336,25 @@ function toWallClockSeconds(date) {
   return Math.floor(new Date(local).getTime() / 1000);
 }
 
-function formatGoogleStepsHtml(route) {
+/**
+ * @param {number} fromStep Leave out the steps before this one (you bike past them).
+ * @param {string} firstLine Replaces the left-out steps.
+ */
+function formatGoogleStepsHtml(route, fromStep, firstLine) {
   if (!route || !route.legs || route.legs.length === 0) return '';
 
   const leg = route.legs[0];
   const lines = ['<b>🗺️ Step-by-Step Directions:</b>'];
 
-  if (leg.departure_time) {
+  if (leg.departure_time && !firstLine) {
     lines.push(`<b>Depart:</b> ${leg.departure_time.text}`);
   }
+  if (firstLine) lines.push(`1. ${firstLine}`);
+  const offset = firstLine ? 1 - (fromStep || 0) : 0;
 
-  leg.steps.forEach((step, idx) => {
+  leg.steps.forEach((step, stepIndex) => {
+    if (stepIndex < (fromStep || 0)) return;
+    const idx = stepIndex + offset;
     const distText = step.distance && step.distance.text ? ` (${step.distance.text})` : '';
     const durText = step.duration && step.duration.text ? step.duration.text : '';
 

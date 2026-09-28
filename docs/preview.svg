@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+  <rect width="880" height="440" rx="18" fill="#f7f8fb"/>
+
+  <!-- Calendar -->
+  <rect x="24" y="24" width="400" height="392" rx="14" fill="#fff" stroke="#e2e6ee"/>
+  <text x="44" y="54" font-size="13" fill="#5d6679">Tuesday</text>
+  <text x="404" y="54" font-size="13" fill="#5d6679" text-anchor="end">Travel calendar + your calendar</text>
+  <g font-size="11" fill="#5d6679" text-anchor="end">
+    <text x="80" y="84">08:00</text>
+    <text x="80" y="144">09:00</text>
+    <text x="80" y="204">10:00</text>
+    <text x="80" y="264">11:00</text>
+    <text x="80" y="324">12:00</text>
+    <text x="80" y="384">13:00</text>
+  </g>
+  <g stroke="#e2e6ee">
+    <line x1="88" y1="80" x2="404" y2="80"/>
+    <line x1="88" y1="140" x2="404" y2="140"/>
+    <line x1="88" y1="200" x2="404" y2="200"/>
+    <line x1="88" y1="260" x2="404" y2="260"/>
+    <line x1="88" y1="320" x2="404" y2="320"/>
+    <line x1="88" y1="380" x2="404" y2="380"/>
+    <line x1="88" y1="72" x2="88" y2="400"/>
+  </g>
+  <g font-size="13" font-weight="700" fill="#fff">
+    <rect x="96" y="105" width="300" height="30" rx="8" fill="#7986cb"/>
+    <text x="106" y="125">🚆 Leave 08:25 · NS</text>
+    <rect x="96" y="140" width="300" height="90" rx="8" fill="#33b679"/>
+    <text x="106" y="160">Lecture</text>
+    <text x="106" y="178" font-weight="400" font-size="12">Main Building, Delft</text>
+    <rect x="96" y="230" width="300" height="20" rx="6" fill="#7986cb"/>
+    <text x="106" y="245" font-size="12">🚶 Leave 10:30 · Walking</text>
+    <rect x="96" y="252" width="300" height="88" rx="8" fill="#33b679"/>
+    <text x="106" y="272">Project meeting</text>
+    <text x="106" y="290" font-weight="400" font-size="12">Library, Delft</text>
+    <rect x="96" y="342" width="300" height="34" rx="8" fill="#7986cb"/>
+    <text x="106" y="364">🚲 Leave 12:20 · Biking home</text>
+  </g>
+
+  <!-- Event detail -->
+  <rect x="448" y="24" width="408" height="392" rx="14" fill="#fff" stroke="#e2e6ee"/>
+  <text x="472" y="64" font-size="20" font-weight="700" fill="#1d2330">🚆 Leave 08:25 · NS</text>
+  <text x="472" y="88" font-size="13" fill="#5d6679">Tuesday · 08:25 – 08:55</text>
+  <text x="472" y="122" font-size="14" fill="#1a73e8">📍 Open NS Journey Planner</text>
+  <text x="472" y="154" font-size="14" fill="#1d2330"><tspan font-weight="700">Route:</tspan> Home ➔ Main Building, Delft</text>
+  <text x="472" y="176" font-size="14" fill="#1d2330"><tspan font-weight="700">Duration:</tspan> 28 mins, 0 transfer(s)</text>
+  <text x="472" y="214" font-size="14" font-weight="700" fill="#1d2330">📊 Travel Options Comparison:</text>
+  <g font-size="14" fill="#1d2330">
+    <text x="472" y="246">🚶 <tspan fill="#1a73e8">Walking</tspan>: <tspan font-weight="700">1 hour 20 mins</tspan></text>
+    <text x="472" y="276">🚲 <tspan fill="#1a73e8">Biking</tspan>: <tspan font-weight="700">42 mins</tspan></text>
+    <text x="472" y="306">🚌 <tspan fill="#1a73e8">Transit</tspan>: <tspan font-weight="700">31 mins</tspan>, leave 08:22</text>
+    <text x="472" y="336">🚆 <tspan fill="#1a73e8">NS</tspan>: <tspan font-weight="700">28 mins</tspan>, leave 08:25 (€3.40)</text>
+    <text x="472" y="366">🚗 <tspan fill="#1a73e8">Driving</tspan>: <tspan font-weight="700">24 mins</tspan></text>
+  </g>
+  <rect x="704" y="322" width="64" height="20" rx="10" fill="#e8f0fe"/>
+  <text x="736" y="336" font-size="11" fill="#1a73e8" text-anchor="middle">chosen</text>
+</svg>

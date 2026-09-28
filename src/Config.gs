@@ -8,13 +8,18 @@
  * file can stay free of personal details (handy if you keep it in a public repo).
  */
 const CONFIG = {
-  // Calendars to read events from.
+  // Read events from every calendar that is enabled (checked) in Google Calendar.
+  // Enabling or disabling a calendar there is picked up automatically on the next run.
+  // false = only read the calendars listed in SOURCE_CALENDARS.
+  USE_ALL_ENABLED_CALENDARS: true,
+
+  // Optional settings per calendar. Not needed unless a calendar needs one of these.
   SOURCE_CALENDARS: [
-    {
-      id: 'primary',          // 'primary' or a calendar ID (Calendar settings → Integrate calendar)
-      locationPrefix: '',     // Prepended to every location, e.g. 'My University, ' when events only list a room
-      defaultLocation: ''     // Used when an event has no location at all ('' = skip those events)
-    }
+    // {
+    //   id: 'primary',          // 'primary' or a calendar ID (Calendar settings → Integrate calendar)
+    //   locationPrefix: '',     // Prepended to every location, e.g. 'My University, ' when events only list a room
+    //   defaultLocation: ''     // Used when an event has no location at all ('' = skip those events)
+    // }
   ],
 
   // Calendar the travel blocks are written to. Use a DEDICATED calendar: the script
@@ -24,6 +29,7 @@ const CONFIG = {
   HOME_LOCATION: 'Your Street 1, Your City, Country', // Script Property: HOME_LOCATION
 
   // NS (Dutch Railways) API key from https://apiportal.ns.nl/ (product "Ns-App").
+  // Trains are planned from the station nearest to you (biking or walking there).
   // Leave empty to disable the NS travel option.
   NS_API_KEY: '', // Script Property: NS_API_KEY
 
@@ -34,6 +40,28 @@ const CONFIG = {
   MIN_TRAVEL_DURATION_SEC: 180,         // Ignore trips shorter than 3 minutes
   API_DELAY_MS: 150,                    // Pause between Maps API calls to avoid rate limit errors
   SKIP_DECLINED_EVENTS: true,           // Don't plan travel for events you declined
+
+  // An all-day event spanning several days with a location means you sleep there
+  // (a hotel, staying with family). An event from Friday to Sunday: Friday you leave
+  // from home and end the day there, Saturday you start and end there, Sunday you
+  // start there and go home. Single-day all-day events are ignored.
+  ALL_DAY_EVENT_IS_HOME: true,
+
+  // Travel you plan yourself: an event you add to the travel calendar just before an
+  // event (or just after the last event of the day) means no travel block is added.
+  MANUAL_TRAVEL: {
+    windowMinutes: 120                  // How far before (or after) an event your own travel event may be
+  },
+
+  // Your bike. The script keeps track of where it is: at home, where you biked to,
+  // or at the stop/station where you parked it to take public transport. Leaving
+  // from home, public transport starts with a bike ride to the stop or station;
+  // at the end of the day you travel back to your bike and ride it home.
+  BIKE: {
+    parkMinutes: 5,                     // Parking your bike at a stop or station
+    pickUpMinutes: 2,                   // Getting it again
+    maxStationDistanceKm: 8             // Consider NS stations up to this far away when biking
+  },
 
   // How the "best" travel mode is chosen.
   MODE_SELECTION: {

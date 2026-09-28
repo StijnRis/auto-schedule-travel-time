@@ -3,7 +3,7 @@
  *
  * Creates "travel blocks" in a separate calendar before (and after) your events,
  * telling you when to leave and how to get there: walking, biking, public transport
- * (Google Maps and NS) or driving.
+ * (Google Maps and NS) or driving. It keeps track of where your bike is.
  *
  * Setup:
  * 1. Add all .gs files from this project to a new project on https://script.google.com/
@@ -15,6 +15,7 @@ const SOURCE_TAG = 'SOURCE_EVENT_ID';
 const STATE_PREFIX = 'TRAVEL_STATE_';
 const MAX_RUNTIME_MS = 5 * 60 * 1000; // Apps Script stops a run after 6 minutes
 const CODE_FINGERPRINT_KEY = 'CODE_FINGERPRINT';
+const MAX_CALENDAR_TRIGGERS = 15;      // Apps Script allows 20 triggers per script
 
 // Route requests / block creations that failed during this run.
 let failedRequests = 0;
@@ -36,14 +37,43 @@ function installTriggers() {
     .filter(t => t.getHandlerFunction() === 'onCalendarChange')
     .forEach(t => ScriptApp.deleteTrigger(t));
 
-  CONFIG.SOURCE_CALENDARS.forEach(cfg => {
-    const calendarId = cfg.id === 'primary' ? Session.getEffectiveUser().getEmail() : cfg.id;
-    ScriptApp.newTrigger('onCalendarChange').forUserCalendar(calendarId).onEventUpdated().create();
-    console.log(`Installed calendar trigger for ${calendarId}`);
-  });
+  syncCalendarTriggers(getSourceCalendars().map(s => s.calendar.getId()));
 
   ScriptApp.newTrigger('onCalendarChange').timeBased().everyDays(1).atHour(5).create();
   console.log('Installed daily trigger (around 05:00).');
+}
+
+/**
+ * Makes sure there is a calendar trigger for exactly the given calendars, so
+ * calendars you enable or disable later are picked up by the next run.
+ */
+function syncCalendarTriggers(calendarIds) {
+  const wanted = calendarIds.slice(0, MAX_CALENDAR_TRIGGERS);
+  if (calendarIds.length > wanted.length) {
+    console.warn(`Only ${MAX_CALENDAR_TRIGGERS} calendars can have a change trigger; the others are checked by the daily run.`);
+  }
+
+  const installed = new Set();
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'onCalendarChange' && t.getEventType() === ScriptApp.EventType.ON_EVENT_UPDATED)
+    .forEach(t => {
+      const id = t.getTriggerSourceId();
+      if (wanted.includes(id) && !installed.has(id)) {
+        installed.add(id);
+      } else {
+        ScriptApp.deleteTrigger(t);
+        console.log(`Removed calendar trigger for ${id}`);
+      }
+    });
+
+  wanted.filter(id => !installed.has(id)).forEach(id => {
+    try {
+      ScriptApp.newTrigger('onCalendarChange').forUserCalendar(id).onEventUpdated().create();
+      console.log(`Installed calendar trigger for ${id}`);
+    } catch (e) {
+      console.warn(`Could not install a trigger for calendar ${id}: ${e}`);
+    }
+  });
 }
 
 /**
@@ -95,10 +125,20 @@ function runScan(deadline) {
   const { now, future } = getSearchWindow(CONFIG.SEARCH_RANGE_DAYS);
   console.log(`=== START SCAN: ${now.toLocaleString()} to ${future.toLocaleString()} ===`);
 
-  const sourceEvents = fetchAndMergeSourceEvents(CONFIG.SOURCE_CALENDARS, now, future);
+  const sources = getSourceCalendars();
+  console.log(`Reading ${sources.length} calendar(s): ${sources.map(s => s.calendar.getName()).join(', ')}`);
+  try {
+    syncCalendarTriggers(sources.map(s => s.calendar.getId()));
+  } catch (e) {
+    console.warn(`Could not update calendar triggers: ${e}`);
+  }
+
+  const { events: sourceEvents, homes } = fetchAndMergeSourceEvents(sources, now, future);
   console.log(`Found ${sourceEvents.length} eligible source events.`);
 
   const existingBlocks = indexTravelBlocks(targetCalendar, now, future);
+  const manualTravel = findManualTravelInTarget(targetCalendar, now, future);
+  const context = { homes, manualTravel };
 
   // Clean up travel blocks whose source events were deleted
   cleanupOrphanedTravelBlocks(existingBlocks, sourceEvents, now, future);
@@ -107,6 +147,8 @@ function runScan(deadline) {
   logCodeUpdate(props);
   const configFingerprint = getConfigFingerprint();
   let unchanged = 0;
+  // Where your bike is ({ name, location }); null = at home. Followed trip by trip.
+  let bike = null;
 
   for (let i = 0; i < sourceEvents.length; i++) {
     if (Date.now() > deadline) {
@@ -118,13 +160,14 @@ function runScan(deadline) {
     const currentEvent = sourceEvents[i];
     const eventKey = getEventKey(currentEvent);
     const existing = existingBlocks.get(eventKey) || [];
-    const plan = planTrip(sourceEvents, i);
+    const plan = planTrip(sourceEvents, i, context, bike);
 
     // Keep the existing blocks when nothing that affects the trip has changed.
     const stateKey = getStateKey(eventKey);
     const hash = shortHash(JSON.stringify([plan, configFingerprint]), 24);
     const previous = JSON.parse(props.getProperty(stateKey) || 'null');
     if (previous && previous.hash === hash && previous.blocks === existing.length) {
+      if (previous.bike !== undefined) bike = previous.bike;
       unchanged++;
       continue;
     }
@@ -136,11 +179,12 @@ function runScan(deadline) {
     deleteBlocks(existing, 'REFRESH: Removing old travel block');
 
     const failuresBefore = failedRequests;
-    const created = createBlocksForPlan(targetCalendar, eventKey, plan);
+    const result = createBlocksForPlan(targetCalendar, eventKey, plan);
+    bike = result.bike;
 
     // Only remember the result when everything worked, so failures are retried next run.
     if (failedRequests === failuresBefore) {
-      props.setProperty(stateKey, JSON.stringify({ hash, blocks: created }));
+      props.setProperty(stateKey, JSON.stringify({ hash, blocks: result.created, bike }));
     } else {
       props.deleteProperty(stateKey);
       console.warn('  -> Some requests failed; this event will be retried on the next run.');
@@ -154,18 +198,32 @@ function runScan(deadline) {
 /**
  * Everything that determines an event's travel blocks. As long as this stays the
  * same, the existing blocks are kept.
+ * @param {Object|null} bike Where your bike is before this trip (null = at home).
  */
-function planTrip(sourceEvents, index) {
+function planTrip(sourceEvents, index, context, bike) {
   const event = sourceEvents[index];
   const destination = event.resolvedLocation;
-  if (!destination) return { destination: '' };
+  if (!destination) return { destination: '', bike };
 
   // Evaluate special keyword rules (e.g. Flight / Vlucht / Vliegen)
   const ruleMatch = getMatchingRule(event.getTitle());
   const bufferMins = ruleMatch ? ruleMatch.arrivalBufferMinutes : CONFIG.ARRIVAL_BUFFER_MINUTES;
   const disableReturnHome = ruleMatch ? ruleMatch.disableReturnHome : false;
-  const { origin, originSource } = determineOrigin(sourceEvents, index);
+
+  // Where you slept last night and where you sleep tonight (all-day events).
+  const day = dayKeyOf(event.getStartTime());
+  const morningHome = getNightLocation(previousDayKey(day), context.homes) || getSetting('HOME_LOCATION');
+  const eveningHome = getNightLocation(day, context.homes) || getSetting('HOME_LOCATION');
+
+  const { origin, originSource } = determineOrigin(sourceEvents, index, morningHome);
   const planReturn = !disableReturnHome && isLastEventOfDay(sourceEvents, index);
+  const previous = findPreviousEvent(sourceEvents, index);
+  const eventStart = event.getStartTime().getTime();
+  const eventEnd = event.getEndTime().getTime();
+  const previousEnd = previous ? previous.getEndTime().getTime() : null;
+
+  // Leaving from home means your bike is at home.
+  if (isActualHome(origin)) bike = null;
 
   return {
     destination,
@@ -174,19 +232,27 @@ function planTrip(sourceEvents, index) {
     ruleMatched: Boolean(ruleMatch),
     bufferMins,
     disableReturnHome,
-    arrivalTime: event.getStartTime().getTime() - (bufferMins * 60 * 1000),
-    returnStart: planReturn ? event.getEndTime().getTime() : null,
-    home: planReturn ? getSetting('HOME_LOCATION') : null
+    eventStart,
+    arrivalTime: eventStart - (bufferMins * 60 * 1000),
+    previousTitle: previous ? previous.getTitle() : null,
+    previousEnd,
+    bike,
+    manualOutbound: findManualOutbound(context.manualTravel, eventStart, previousEnd),
+    manualReturn: planReturn ? findManualReturn(context.manualTravel, eventEnd) : null,
+    returnStart: planReturn ? eventEnd : null,
+    home: planReturn ? eveningHome : null
   };
 }
 
 /**
- * Creates the outbound (and, if needed, return) travel block. Returns how many were created.
+ * Creates the outbound (and, if needed, return) travel block.
+ * Returns how many were created and where your bike is afterwards.
  */
 function createBlocksForPlan(targetCalendar, eventKey, plan) {
+  let bike = plan.bike;
   if (!plan.destination) {
     console.log(`  -> SKIP: No location specified or resolved from defaults.`);
-    return 0;
+    return { created: 0, bike };
   }
 
   if (plan.ruleMatched) {
@@ -194,49 +260,140 @@ function createBlocksForPlan(targetCalendar, eventKey, plan) {
   }
 
   let created = 0;
-  const arrivalTime = new Date(plan.arrivalTime);
-  const routes = calculateAllRoutes(plan.origin, plan.destination, arrivalTime, false);
-  const selectedRoute = selectBestTravelMode(routes);
-
-  // Create Outbound Travel Block
-  if (isUsableRoute(selectedRoute, '')) {
-    const ok = createTravelBlock({
-      targetCalendar,
-      eventKey,
-      isReturn: false,
-      origin: plan.origin,
-      destination: plan.destination,
-      originSource: plan.originSource,
-      selectedRoute,
-      routes,
-      bufferMins: plan.bufferMins
-    });
-    if (ok) created++;
+  if (plan.manualOutbound) {
+    console.log(`  -> SKIP: You already planned travel yourself ("${plan.manualOutbound.title}").`);
+  } else {
+    const outbound = handleOutboundTravel(targetCalendar, eventKey, plan);
+    created += outbound.created;
+    bike = bikeAfter(outbound.route, bike, plan.destination);
   }
 
   // Handle Return Travel Block if last event of the day AND return is not disabled by a rule
   if (plan.disableReturnHome) {
     console.log(`  -> SKIP RETURN: Return travel disabled by special rule.`);
-  } else if (plan.returnStart && handleReturnTravel(targetCalendar, eventKey, plan)) {
-    created++;
+  } else if (plan.manualReturn) {
+    console.log(`  -> SKIP RETURN: You already planned travel yourself ("${plan.manualReturn.title}").`);
+  } else if (plan.returnStart) {
+    const back = handleReturnTravel(targetCalendar, eventKey, plan, bike);
+    created += back.created;
+    bike = back.bike;
   }
-  return created;
+  return { created, bike };
 }
 
 /**
- * Handles generating a return travel block back home for the last event of the day
+ * Where your bike is after a trip: where you biked to, where you parked it before
+ * taking public transport, or else still where it was.
  */
-function handleReturnTravel(targetCalendar, eventKey, plan) {
+function bikeAfter(route, bike, destination) {
+  if (!route) return bike;
+  if (route.pickedUpBike) return null;
+  if (route.key === 'BICYCLING') return isActualHome(destination) ? null : { name: destination, location: destination };
+  if (route.bikeParkedAt) return route.bikeParkedAt;
+  return bike;
+}
+
+/** Whether your bike is at the given location (null = at home). */
+function hasBikeAt(bike, location) {
+  return bike ? bike.location === location : isActualHome(location);
+}
+
+/**
+ * Creates the outbound travel block. When you would have to leave before the
+ * previous event ends, the trip doesn't fit: then two ❗ blocks are created, one
+ * that arrives on time (leaving early) and one that leaves on time (arriving late).
+ * Returns how many blocks were created and the route you take (for the bike).
+ */
+function handleOutboundTravel(targetCalendar, eventKey, plan) {
+  const withBike = hasBikeAt(plan.bike, plan.origin);
+  const routes = calculateAllRoutes(plan.origin, plan.destination, new Date(plan.arrivalTime), false, withBike, plan.bike);
+  const selectedRoute = selectBestTravelMode(routes);
+  if (!isUsableRoute(selectedRoute, '')) return { created: 0, route: null };
+
+  const base = {
+    targetCalendar,
+    eventKey,
+    isReturn: false,
+    origin: plan.origin,
+    destination: plan.destination,
+    originSource: plan.originSource,
+    bufferMins: plan.bufferMins
+  };
+
+  const fits = !plan.previousEnd || selectedRoute.departureTime.getTime() >= plan.previousEnd;
+  if (fits) {
+    const ok = createTravelBlock(Object.assign({ selectedRoute, routes }, base));
+    return { created: ok ? 1 : 0, route: selectedRoute };
+  }
+
+  // Not enough time: see what happens when you leave as soon as the previous event ends.
+  const previousEnd = new Date(plan.previousEnd);
+  const leaveRoutes = calculateAllRoutes(plan.origin, plan.destination, previousEnd, true, withBike, plan.bike);
+  const leaveRoute = selectBestTravelMode(leaveRoutes);
+  const previous = `"${escapeHtml(plan.previousTitle)}" ends at ${formatTime(previousEnd)}`;
+
+  // Still there before the event starts (only less buffer): one block is enough.
+  if (leaveRoute && leaveRoute.arrivalTime.getTime() <= plan.eventStart) {
+    console.log(`  -> TIGHT: Leaving when the previous event ends still gets you there before the start.`);
+    const ok = createTravelBlock(Object.assign({}, base, {
+      selectedRoute: leaveRoute,
+      routes: leaveRoutes,
+      note: `${previous}; leaving right after it you arrive ${formatTime(leaveRoute.arrivalTime)}, with less buffer than usual.`
+    }));
+    return { created: ok ? 1 : 0, route: leaveRoute };
+  }
+
+  console.log(`  -> CONFLICT: Not enough time after the previous event; creating an "arrive on time" and a "leave on time" block.`);
+  let created = 0;
+  if (createTravelBlock(Object.assign({}, base, {
+    selectedRoute,
+    routes,
+    warning: 'arrive on time',
+    note: `Not enough time: ${previous}. This option leaves before it ends, so you arrive on time.`
+  }))) created++;
+
+  if (leaveRoute) {
+    const lateMins = Math.ceil((leaveRoute.arrivalTime.getTime() - plan.eventStart) / 60000);
+    if (createTravelBlock(Object.assign({}, base, {
+      selectedRoute: leaveRoute,
+      routes: leaveRoutes,
+      warning: `${lateMins} min late`,
+      note: `Not enough time: ${previous}. This option leaves when it ends and arrives ${lateMins} min after the start.`
+    }))) created++;
+  }
+  return { created, route: selectedRoute };
+}
+
+/**
+ * Handles generating a return travel block for the last event of the day. Going
+ * to your actual home you take your bike along: ride it home when you have it
+ * with you, or first travel to where you parked it. Returns { created, bike }.
+ */
+function handleReturnTravel(targetCalendar, eventKey, plan, bike) {
   const endTime = new Date(plan.returnStart);
+  const withBike = hasBikeAt(bike, plan.destination);
+  const fetchBike = isActualHome(plan.home) && bike !== null && !withBike;
 
   console.log(`  -> CHECKING RETURN: Last event of day. Processing return home...`);
 
-  const returnRoutes = calculateAllRoutes(plan.destination, plan.home, endTime, true);
-  const selectedRoute = selectBestTravelMode(returnRoutes);
+  let returnRoutes;
+  let selectedRoute;
+  if (fetchBike) {
+    console.log(`  -> Your bike is at ${bike.name}; going there first.`);
+    returnRoutes = calculateAllRoutes(plan.destination, bike.location, endTime, true, false, bike);
+    returnRoutes.toBike = bike.name;
+    selectedRoute = withBikeRide(selectBestTravelMode(returnRoutes), bike, plan.home, endTime);
+  } else {
+    returnRoutes = calculateAllRoutes(plan.destination, plan.home, endTime, true, withBike, bike);
+    // With your bike at the event you ride it home.
+    selectedRoute = isActualHome(plan.home) && withBike && returnRoutes.BICYCLING
+      ? returnRoutes.BICYCLING
+      : selectBestTravelMode(returnRoutes);
+  }
 
-  if (!isUsableRoute(selectedRoute, ' (Return)')) return false;
+  if (!isUsableRoute(selectedRoute, ' (Return)')) return { created: 0, bike };
 
-  return createTravelBlock({
+  const ok = createTravelBlock({
     targetCalendar,
     eventKey,
     isReturn: true,
@@ -247,6 +404,37 @@ function handleReturnTravel(targetCalendar, eventKey, plan) {
     routes: returnRoutes,
     bufferMins: 0
   });
+  return { created: ok ? 1 : 0, bike: bikeAfter(selectedRoute, bike, plan.home) };
+}
+
+/**
+ * Trip home via your parked bike: travel to it (route; null or very short when
+ * it's right there), pick it up and ride home.
+ */
+function withBikeRide(route, bike, home, endTime) {
+  const rideSec = getCachedDuration('BICYCLING', bike.location, home);
+  if (rideSec === null) return route;
+
+  const pickUpMs = CONFIG.BIKE.pickUpMinutes * 60 * 1000;
+  const reachBike = route && route.durationSec >= CONFIG.MIN_TRAVEL_DURATION_SEC ? route : null;
+  const mode = reachBike ? TRAVEL_MODES[reachBike.key] : TRAVEL_MODES.BICYCLING;
+  const departureTime = reachBike ? reachBike.departureTime : endTime;
+  const arrivalTime = new Date((reachBike ? reachBike.arrivalTime.getTime() : endTime.getTime()) + pickUpMs + rideSec * 1000);
+  const durationMins = Math.round((arrivalTime - departureTime) / 60000);
+  const rideLine = `🚲 Pick up your bike at <i>${escapeHtml(bike.name)}</i> (${CONFIG.BIKE.pickUpMinutes} min) and bike home: ${Math.round(rideSec / 60)} mins`;
+
+  return {
+    key: reachBike ? reachBike.key : 'BICYCLING',
+    label: reachBike ? `${reachBike.label || mode.label} + bike` : mode.label,
+    emoji: reachBike ? `${reachBike.emoji || mode.emoji}🚲` : mode.emoji,
+    durationSec: durationMins * 60,
+    durationText: `${durationMins} mins`,
+    departureTime,
+    arrivalTime,
+    url: reachBike ? reachBike.url : buildGoogleMapsUrl(bike.location, home, mode.urlCode, endTime, true),
+    stepsHtml: [reachBike ? reachBike.stepsHtml : '', rideLine].filter(Boolean).join('<br>'),
+    pickedUpBike: true
+  };
 }
 
 function isUsableRoute(route, label) {
@@ -273,6 +461,86 @@ function getMatchingRule(eventTitle) {
   return CONFIG.SPECIAL_RULES.find(rule =>
     rule.keywords.some(kw => lowerTitle.includes(kw.toLowerCase()))
   ) || null;
+}
+
+// --- HOME, PREVIOUS EVENT AND MANUAL TRAVEL ---
+
+/**
+ * Where you sleep the night after the given day ('yyyy-MM-dd'), according to your
+ * all-day events, or null for your normal home. An all-day event spanning several
+ * days covers the nights in between: from the first day until the morning of the
+ * last day. Single-day events are not stays (see fetchAndMergeSourceEvents).
+ */
+function getNightLocation(day, homes) {
+  const covering = (homes || []).filter(h => h.firstDay <= day && day < h.lastDay);
+  if (covering.length === 0) return null;
+  // Several? The one that started last (e.g. a night elsewhere during a longer stay).
+  return covering.reduce((best, h) => (h.firstDay > best.firstDay ? h : best)).location;
+}
+
+function isActualHome(location) {
+  return location === getSetting('HOME_LOCATION');
+}
+
+function dayKeyOf(date) {
+  return Utilities.formatDate(date, getTimeZone(), 'yyyy-MM-dd');
+}
+
+/** The day before a 'yyyy-MM-dd' day (calendar arithmetic, safe around DST). */
+function previousDayKey(day) {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d - 1)).toISOString().substring(0, 10);
+}
+
+/**
+ * The event that ends last before this one starts (and not longer ago than
+ * MAX_GAP_BEFORE_HOME_HOURS). You can only leave once it is over.
+ */
+function findPreviousEvent(events, index) {
+  const start = events[index].getStartTime().getTime();
+  const maxGapMs = CONFIG.MAX_GAP_BEFORE_HOME_HOURS * 60 * 60 * 1000;
+  let previous = null;
+  for (let j = 0; j < index; j++) {
+    const end = events[j].getEndTime().getTime();
+    if (end <= start && start - end < maxGapMs && (!previous || end > previous.getEndTime().getTime())) {
+      previous = events[j];
+    }
+  }
+  return previous;
+}
+
+/**
+ * A travel event you added yourself that ends shortly before the event starts
+ * (and after the previous event ended). Returns { title, start, end } or null.
+ */
+function findManualOutbound(manualTravel, eventStart, previousEnd) {
+  const windowMs = CONFIG.MANUAL_TRAVEL.windowMinutes * 60 * 1000;
+  const earliestEnd = Math.max(eventStart - windowMs, previousEnd || 0);
+  return (manualTravel || []).find(m =>
+    m.start < eventStart && m.end >= earliestEnd && m.end <= eventStart + 15 * 60 * 1000) || null;
+}
+
+/**
+ * A travel event you added yourself that starts shortly after the event ends.
+ */
+function findManualReturn(manualTravel, eventEnd) {
+  const windowMs = CONFIG.MANUAL_TRAVEL.windowMinutes * 60 * 1000;
+  return (manualTravel || []).find(m =>
+    m.end > eventEnd && m.start >= eventEnd - 15 * 60 * 1000 && m.start <= eventEnd + windowMs) || null;
+}
+
+function toManualTravel(event) {
+  return { title: event.getTitle(), start: event.getStartTime().getTime(), end: event.getEndTime().getTime() };
+}
+
+/**
+ * Events you added to the travel calendar yourself (everything without our tag).
+ */
+function findManualTravelInTarget(targetCalendar, windowStart, windowEnd) {
+  const searchStart = new Date(windowStart.getTime() - (24 * 60 * 60 * 1000));
+  return targetCalendar.getEvents(searchStart, windowEnd)
+    .filter(evt => !evt.getTag(SOURCE_TAG) && !evt.isAllDayEvent())
+    .map(toManualTravel);
 }
 
 // --- TRAVEL BLOCK BOOKKEEPING ---
@@ -375,7 +643,7 @@ function getCodeFingerprint() {
   }
 
   const tables = [TRAVEL_MODES, ROUTE_DISPLAY_ORDER, GOOGLE_MODE_KEYS, TRANSIT_SEARCH_SHIFT_MIN,
-    ALTERNATIVE_WINDOW_MIN, NS_TRIPS_URL, NS_TIME_ZONE, SOURCE_TAG];
+    ALTERNATIVE_WINDOW_MIN, NS_TRIPS_URL, NS_TIME_ZONE, NS_PLANNER_URL, NS_API_BASE, NS_LOCAL_TRANSIT_WAIT_MIN, SOURCE_TAG];
   return shortHash(JSON.stringify([sources, tables]), 16);
 }
 
@@ -445,31 +713,67 @@ function getSearchWindow(days) {
 }
 
 /**
- * Events that never get travel blocks and don't count as a "previous location".
+ * The calendars to read events from, each with its settings from SOURCE_CALENDARS.
+ * By default that's every calendar that is enabled (checked) in Google Calendar,
+ * except the travel calendar itself.
  */
-function isIgnoredEvent(event) {
-  if (event.getTag(SOURCE_TAG)) return true;   // One of our own travel blocks
-  if (event.isAllDayEvent()) return true;
-  if (CONFIG.SKIP_DECLINED_EVENTS && event.getMyStatus() === CalendarApp.GuestStatus.NO) return true;
-  return false;
+function getSourceCalendars() {
+  const targetId = getSetting('TARGET_CALENDAR_ID');
+  const configs = CONFIG.SOURCE_CALENDARS || [];
+  const defaultId = CalendarApp.getDefaultCalendar().getId();
+  const configFor = id => configs.find(cfg => (cfg.id === 'primary' ? defaultId : cfg.id) === id) || {};
+
+  let calendars;
+  if (CONFIG.USE_ALL_ENABLED_CALENDARS) {
+    calendars = CalendarApp.getAllCalendars().filter(cal => cal.isSelected() && !cal.isHidden());
+  } else {
+    calendars = configs.map(cfg => {
+      const cal = CalendarApp.getCalendarById(cfg.id);
+      if (!cal) console.warn(`Could not access source calendar: ${cfg.id}`);
+      return cal;
+    }).filter(Boolean);
+  }
+
+  return calendars
+    .filter(cal => cal.getId() !== targetId)
+    .map(calendar => ({ calendar, cfg: configFor(calendar.getId()) }));
 }
 
-function fetchAndMergeSourceEvents(calendarConfigs, start, end) {
-  let allEvents = [];
+/**
+ * Reads the source calendars. Returns the events that need travel, plus the
+ * all-day events that say where you sleep ({ firstDay, lastDay, location }).
+ */
+function fetchAndMergeSourceEvents(sources, start, end) {
+  const events = [];
+  const homes = [];
+  const seen = new Set();
+  // A day earlier, to know where you slept last night.
+  const lookBack = new Date(start.getTime() - (24 * 60 * 60 * 1000));
 
-  calendarConfigs.forEach(cfg => {
-    const cal = CalendarApp.getCalendarById(cfg.id);
-    if (!cal) {
-      console.warn(`Could not access source calendar: ${cfg.id}`);
-      return;
-    }
+  sources.forEach(({ calendar, cfg }) => {
+    calendar.getEvents(lookBack, end).forEach(event => {
+      if (event.getTag(SOURCE_TAG)) return;   // One of our own travel blocks
+      if (CONFIG.SKIP_DECLINED_EVENTS && event.getMyStatus() === CalendarApp.GuestStatus.NO) return;
 
-    cal.getEvents(start, end).forEach(event => {
-      if (isIgnoredEvent(event)) return;
+      // The same event can show up in several calendars (e.g. a shared one).
+      const key = getEventKey(event);
+      if (seen.has(key)) return;
+      seen.add(key);
 
-      const rawLocation = event.getLocation() ? event.getLocation().trim() : '';
+      const rawLocation = event.getLocation() ? singleLine(event.getLocation()) : '';
+
+      if (event.isAllDayEvent()) {
+        const firstDay = dayKeyOf(event.getStartTime());
+        const lastDay = dayKeyOf(new Date(event.getEndTime().getTime() - 1));
+        // Only a multi-day event is a stay; a single-day one (a festival, a day out) is not.
+        if (CONFIG.ALL_DAY_EVENT_IS_HOME && rawLocation && firstDay < lastDay) {
+          homes.push({ firstDay, lastDay, location: rawLocation });
+        }
+        return;
+      }
+      if (event.getEndTime() <= start) return;
+
       let finalLocation = '';
-
       if (rawLocation) {
         finalLocation = (cfg.locationPrefix || '') + rawLocation;
       } else if (cfg.defaultLocation) {
@@ -477,15 +781,16 @@ function fetchAndMergeSourceEvents(calendarConfigs, start, end) {
       }
 
       event.resolvedLocation = finalLocation;
-      allEvents.push(event);
+      events.push(event);
     });
   });
 
-  return allEvents.sort((a, b) => a.getStartTime() - b.getStartTime());
+  events.sort((a, b) => a.getStartTime() - b.getStartTime());
+  return { events, homes };
 }
 
-function determineOrigin(events, currentIndex) {
-  let origin = getSetting('HOME_LOCATION');
+function determineOrigin(events, currentIndex, home) {
+  let origin = home;
   let originSource = 'Default (Home)';
 
   if (currentIndex > 0) {
@@ -510,18 +815,20 @@ function isLastEventOfDay(events, currentIndex) {
 
 // --- CALENDAR EVENT OUTPUT ---
 
-function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destination, originSource, selectedRoute, routes, bufferMins }) {
+function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destination, originSource, selectedRoute, routes, bufferMins, warning, note }) {
   // The block covers the actual travel: for public transport that's from leaving
   // until arriving, which can be earlier than the arrival buffer.
   const start = selectedRoute.departureTime;
   const end = selectedRoute.arrivalTime;
   const leaveAt = formatTime(start);
-  const mode = TRAVEL_MODES[selectedRoute.key];
-  const eventTitle = `${mode.emoji} Leave ${leaveAt} · ${mode.label}${isReturn ? ' home' : ''}`;
+  const emoji = selectedRoute.emoji || TRAVEL_MODES[selectedRoute.key].emoji;
+  const label = selectedRoute.label || TRAVEL_MODES[selectedRoute.key].label;
+  const eventTitle = `${warning ? '❗ ' : ''}${emoji} Leave ${leaveAt} · ${label}${isReturn ? ' home' : ''}${warning ? ` · ${warning}` : ''}`;
 
   const htmlDescription = [
+    note ? `${warning ? '❗ ' : ''}<b>${note}</b><br>` : null,
     `📍 <a href="${selectedRoute.url}"><b>Open ${selectedRoute.key === 'NS' ? 'NS Journey Planner' : 'Google Maps Directions'}</b></a>`,
-    `<br><b>Mode:</b> ${mode.label}${isReturn ? ' (Return)' : ''}`,
+    `<br><b>Mode:</b> ${label}${isReturn ? ' (Return)' : ''}`,
     `<b>Route:</b> ${escapeHtml(singleLine(origin))} ➔ ${escapeHtml(singleLine(destination))}`,
     `<b>Origin Source:</b> ${escapeHtml(originSource)}`,
     `<b>Duration:</b> ${selectedRoute.durationText}`,
@@ -552,14 +859,16 @@ function createTravelBlock({ targetCalendar, eventKey, isReturn, origin, destina
  * Public transport also lists the connection before and after.
  */
 function formatAllRouteSummaryHtml(routes, selectedKey) {
-  const lines = ['<b>📊 Travel Options:</b>'];
+  const lines = [`<b>📊 Travel Options${routes.toBike ? ` to your bike at ${escapeHtml(routes.toBike)}` : ''}:</b>`];
 
   ROUTE_DISPLAY_ORDER.forEach(key => {
     const mode = TRAVEL_MODES[key];
     const r = routes[key];
     if (!r) {
-      // Without an NS key the NS option is simply left out.
-      if (key !== 'NS' || getSetting('NS_API_KEY')) {
+      if (key === 'BICYCLING' && routes.bikeAway) {
+        lines.push(`• ${mode.emoji} ${mode.label}: <i>your bike is at ${escapeHtml(routes.bikeAway)}</i>`);
+      } else if (key !== 'NS' || getSetting('NS_API_KEY')) {
+        // Without an NS key the NS option is simply left out.
         lines.push(`• ${mode.emoji} ${mode.label}: <i>N/A</i>`);
       }
       return;
@@ -567,7 +876,7 @@ function formatAllRouteSummaryHtml(routes, selectedKey) {
     const transfers = r.transfers !== undefined ? ` · ${r.transfers} transfer(s)` : '';
     const fare = r.fareText ? ` · ${escapeHtml(r.fareText)}` : '';
     const marker = key === selectedKey ? ' ✅' : '';
-    lines.push(`• <a href="${r.url}">${mode.emoji} ${mode.label}</a>: <b>${formatTimeSpan(r)}</b>${transfers}${fare}${marker}`);
+    lines.push(`• <a href="${r.url}">${r.emoji || mode.emoji} ${r.label || mode.label}</a>: <b>${formatTimeSpan(r)}</b>${transfers}${fare}${marker}`);
 
     const alternatives = r.alternatives || {};
     [['earlier', 'Arrive earlier'], ['later', 'Arrive later']].forEach(([which, label]) => {
